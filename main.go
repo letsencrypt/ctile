@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -15,9 +17,82 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 )
 
-const backend = "https://oak.ct.letsencrypt.org/2023"
+const backend = "https://oak.ct.letsencrypt.org"
 const tileSize = 256
 const s3bucket = "ctile"
+
+// parseQueryParams returns the start and end values, or an error.
+func parseQueryParams(values url.Values) (int64, int64, error) {
+	start := values.Get("start")
+	end := values.Get("end")
+	if start == "" {
+		return 0, 0, errors.New("missing start parameter")
+	}
+	if end == "" {
+		return 0, 0, errors.New("missing end parameter")
+	}
+	startInt, err := strconv.ParseInt(start, 10, 64)
+	if err != nil || startInt < 0 {
+		return 0, 0, errors.New("invalid start parameter")
+	}
+	endInt, err := strconv.ParseInt(end, 10, 64)
+	if err != nil || endInt < 0 {
+		return 0, 0, errors.New("invalid end parameter")
+	}
+	return startInt, endInt, nil
+}
+
+type tile struct {
+	start    int64
+	end      int64
+	contents entries
+}
+
+type entry struct {
+	LeafInput string `json:"leaf_input"`
+	ExtraData string `json:"extra_data"`
+}
+
+type entries struct {
+	Entries []entry `json:"entries"`
+}
+
+// getTile fetches a tile of entries from the backend, of size tileSize.
+//
+// The returned start value represents the start of the tile, and is guaranteed to
+// be equal or less than the requested start. The returned end value represents the
+// end of the tile, and is guaranteed to be `start + tileSize`.
+func getTile(base, path string, start, end, tileSize int64) (*tile, error) {
+	tileOffset := start % tileSize
+	tileStart := start - tileOffset
+	tileEnd := tileStart + tileSize
+
+	url := fmt.Sprintf("%s/%s?start=%d&end=%d", base, path, tileStart, tileEnd)
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("fetching %s: %s", url, err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetching %s: status code %d", url, resp.StatusCode)
+	}
+
+	var entries entries
+	err = json.NewDecoder(resp.Body).Decode(&entries)
+	if err != nil {
+		return nil, fmt.Errorf("reading body from %s: %s", url, err)
+	}
+
+	if len(entries.Entries) > int(tileSize) || len(entries.Entries) == 0 {
+		return nil, fmt.Errorf("expected %d entries, got %d", tileSize, len(entries.Entries))
+	}
+
+	return &tile{
+		start:    tileStart,
+		end:      tileEnd,
+		contents: entries,
+	}, nil
+}
 
 func main() {
 	sess := session.Must(session.NewSession())
@@ -29,70 +104,23 @@ func main() {
 			fmt.Fprintf(w, "invalid path %q", r.URL.Path)
 			return
 		}
-		start := r.URL.Query().Get("start")
-		end := r.URL.Query().Get("end")
-		if start == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte("missing start parameter"))
-			return
-		}
-		if end == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte("missing end parameter"))
-			return
-		}
-		startInt, err := strconv.ParseInt(start, 10, 64)
+
+		start, end, err := parseQueryParams(r.URL.Query())
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte("invalid start parameter"))
+			fmt.Fprintln(w, err)
 			return
 		}
-		endInt, err := strconv.ParseInt(end, 10, 64)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte("invalid start parameter"))
-			return
-		}
-		fmt.Printf("%d\n", endInt) // XXX
 
-		tileOffset := startInt % tileSize
-		tileStart := startInt - tileOffset
-		tileEnd := tileStart + tileSize
-
-		url := fmt.Sprintf("%s/%s?start=%d&end=%d", backend, r.URL.Path, tileStart, tileEnd)
-		resp, err := http.Get(url)
-		if err != nil {
-			w.WriteHeader(http.StatusBadGateway)
-			fmt.Fprintf(w, "fetching %s: %s", url, err)
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, "fetching %s: status code %d", url, resp.StatusCode)
-		}
-
-		type entry struct {
-			LeafInput string `json:"leaf_input"`
-			ExtraData string `json:"extra_data"`
-		}
-
-		var entries struct {
-			Entries []entry `json:"entries"`
-		}
-
-		err = json.NewDecoder(resp.Body).Decode(&entries)
+		tile, err := getTile(backend, r.URL.Path, start, end, tileSize) //XXX
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, "reading body from %s: %s", url, err)
+			fmt.Fprintln(w, err)
+			return
 		}
 
-		if len(entries.Entries) >= tileSize {
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, "expected %d entries, got %d", tileSize, len(entries.Entries))
-		}
-
-		if len(entries.Entries) == tileSize {
-			key := fmt.Sprintf("%d", tileStart)
+		if len(tile.contents.Entries) == tileSize {
+			key := fmt.Sprintf("%d", tile.start)
 			ctx := context.TODO()
 			_, err := svc.PutObjectWithContext(ctx, &s3.PutObjectInput{
 				Bucket: aws.String(s3bucket),
@@ -105,16 +133,18 @@ func main() {
 		}
 
 		// Truncate to match the request
-		entries.Entries = entries.Entries[tileOffset:]
-		if len(entries.Entries) > int(endInt)-int(startInt) {
-			entries.Entries = entries.Entries[:endInt-startInt]
+		prefixToRemove := start - tile.start
+		tile.contents.Entries = tile.contents.Entries[prefixToRemove:]
+
+		requestedLen := end - start
+		if len(tile.contents.Entries) > int(requestedLen) {
+			tile.contents.Entries = tile.contents.Entries[:requestedLen]
 		}
 
 		encoder := json.NewEncoder(w)
 		encoder.SetIndent("", "  ")
-		encoder.Encode(entries)
+		encoder.Encode(tile.contents)
 	})
 
 	log.Fatal(http.ListenAndServe(":8080", nil))
-
 }
