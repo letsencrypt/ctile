@@ -180,8 +180,10 @@ func main() {
 					return
 				}
 			}
+
+			w.Header().Set("X-Source", "CT log")
 		} else {
-			log.Printf("serving tile from s3: %#v", tile)
+			w.Header().Set("X-Source", "S3")
 		}
 
 		// Truncate to match the request
