@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,7 +9,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 
@@ -19,7 +19,7 @@ import (
 
 const backend = "https://oak.ct.letsencrypt.org"
 const tileSize = 256
-const s3bucket = "ctile"
+const s3bucket = "oak-crud-net"
 
 // parseQueryParams returns the start and end values, or an error.
 func parseQueryParams(values url.Values) (int64, int64, error) {
@@ -43,9 +43,9 @@ func parseQueryParams(values url.Values) (int64, int64, error) {
 }
 
 type tile struct {
-	start    int64
-	end      int64
-	contents entries
+	start int64
+	end   int64
+	size  int64
 }
 
 type entry struct {
@@ -57,17 +57,23 @@ type entries struct {
 	Entries []entry `json:"entries"`
 }
 
-// getTile fetches a tile of entries from the backend, of size tileSize.
+func makeTile(start, end, size int64) tile {
+	tileOffset := start % tileSize
+	tileStart := start - tileOffset
+	return tile{
+		start: tileStart,
+		end:   tileStart + tileSize,
+		size:  tileSize,
+	}
+}
+
+// getTileFromBackend fetches a tile of entries from the backend, of size tileSize.
 //
 // The returned start value represents the start of the tile, and is guaranteed to
 // be equal or less than the requested start. The returned end value represents the
 // end of the tile, and is guaranteed to be `start + tileSize`.
-func getTile(base, path string, start, end, tileSize int64) (*tile, error) {
-	tileOffset := start % tileSize
-	tileStart := start - tileOffset
-	tileEnd := tileStart + tileSize
-
-	url := fmt.Sprintf("%s/%s?start=%d&end=%d", base, path, tileStart, tileEnd)
+func getTileFromBackend(base, path string, t tile) (*entries, error) {
+	url := fmt.Sprintf("%s/%s?start=%d&end=%d", base, path, t.start, t.end)
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("fetching %s: %s", url, err)
@@ -87,11 +93,26 @@ func getTile(base, path string, start, end, tileSize int64) (*tile, error) {
 		return nil, fmt.Errorf("expected %d entries, got %d", tileSize, len(entries.Entries))
 	}
 
-	return &tile{
-		start:    tileStart,
-		end:      tileEnd,
-		contents: entries,
-	}, nil
+	return &entries, nil
+}
+
+func writeToS3(svc *s3.S3, t tile, e *entries) error {
+	body, err := json.Marshal(e)
+	if err != nil {
+		return nil
+	}
+
+	key := fmt.Sprintf("%d", t.start)
+	ctx := context.TODO()
+	_, err = svc.PutObjectWithContext(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(s3bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(body),
+	})
+	if err != nil {
+		return fmt.Errorf("putting in bucket %q with key %q: %s", s3bucket, key, err)
+	}
+	return nil
 }
 
 func main() {
@@ -101,7 +122,7 @@ func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/ct/v1/get-entries") {
 			w.WriteHeader(http.StatusNotFound)
-			fmt.Fprintf(w, "invalid path %q", r.URL.Path)
+			fmt.Fprintf(w, "invalid path %q\n", r.URL.Path)
 			return
 		}
 
@@ -112,38 +133,36 @@ func main() {
 			return
 		}
 
-		tile, err := getTile(backend, r.URL.Path, start, end, tileSize) //XXX
+		tile := makeTile(start, end, tileSize)
+
+		contents, err := getTileFromBackend(backend, r.URL.Path, tile)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Fprintln(w, err)
 			return
 		}
 
-		if len(tile.contents.Entries) == tileSize {
-			key := fmt.Sprintf("%d", tile.start)
-			ctx := context.TODO()
-			_, err := svc.PutObjectWithContext(ctx, &s3.PutObjectInput{
-				Bucket: aws.String(s3bucket),
-				Key:    aws.String(key),
-				Body:   os.Stdin,
-			})
+		if len(contents.Entries) == tileSize {
+			err := writeToS3(svc, tile, contents)
 			if err != nil {
-				log.Printf("putting in s3 bucket %q with key %q: %s", s3bucket, key, err)
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprintf(w, "writing to s3: %s\n", err)
+				return
 			}
 		}
 
 		// Truncate to match the request
 		prefixToRemove := start - tile.start
-		tile.contents.Entries = tile.contents.Entries[prefixToRemove:]
+		contents.Entries = contents.Entries[prefixToRemove:]
 
 		requestedLen := end - start
-		if len(tile.contents.Entries) > int(requestedLen) {
-			tile.contents.Entries = tile.contents.Entries[:requestedLen]
+		if len(contents.Entries) > int(requestedLen) {
+			contents.Entries = contents.Entries[:requestedLen]
 		}
 
 		encoder := json.NewEncoder(w)
 		encoder.SetIndent("", "  ")
-		encoder.Encode(tile.contents)
+		encoder.Encode(contents)
 	})
 
 	log.Fatal(http.ListenAndServe(":8080", nil))
