@@ -96,7 +96,12 @@ func getTileFromBackend(base, path string, t tile) (*entries, error) {
 	return &entries, nil
 }
 
+// writeToS3 stores the entries corresponding to the given tile in s3.
 func writeToS3(svc *s3.S3, t tile, e *entries) error {
+	if len(e.Entries) != int(t.size) || t.end != t.start+t.size {
+		return fmt.Errorf("internal inconsistency: len(entries) == %d; tile = %v", len(e.Entries), t)
+	}
+
 	body, err := json.Marshal(e)
 	if err != nil {
 		return nil
@@ -113,6 +118,29 @@ func writeToS3(svc *s3.S3, t tile, e *entries) error {
 		return fmt.Errorf("putting in bucket %q with key %q: %s", s3bucket, key, err)
 	}
 	return nil
+}
+
+// getFromS3 retrieves the entries corresponding to the given tile from s3.
+func getFromS3(svc *s3.S3, t tile) (*entries, error) {
+	resp, err := svc.GetObject(&s3.GetObjectInput{
+		Bucket: aws.String(s3bucket),
+		Key:    aws.String(fmt.Sprintf("%d", t.start)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("getting from bucket %q with key %q: %s", s3bucket, t.start, err)
+	}
+
+	var entries entries
+	err = json.NewDecoder(resp.Body).Decode(&entries)
+	if err != nil {
+		return nil, fmt.Errorf("reading body from bucket %q with key %q: %s", s3bucket, t.start, err)
+	}
+
+	if len(entries.Entries) != int(t.size) || t.end != t.start+t.size {
+		return nil, fmt.Errorf("internal inconsistency: len(entries) == %d; tile = %v", len(entries.Entries), t)
+	}
+
+	return &entries, nil
 }
 
 func main() {
@@ -135,20 +163,25 @@ func main() {
 
 		tile := makeTile(start, end, tileSize)
 
-		contents, err := getTileFromBackend(backend, r.URL.Path, tile)
+		contents, err := getFromS3(svc, tile)
 		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintln(w, err)
-			return
-		}
-
-		if len(contents.Entries) == tileSize {
-			err := writeToS3(svc, tile, contents)
+			contents, err = getTileFromBackend(backend, r.URL.Path, tile)
 			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
-				fmt.Fprintf(w, "writing to s3: %s\n", err)
+				fmt.Fprintln(w, err)
 				return
 			}
+
+			if len(contents.Entries) == tileSize {
+				err := writeToS3(svc, tile, contents)
+				if err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					fmt.Fprintf(w, "writing to s3: %s\n", err)
+					return
+				}
+			}
+		} else {
+			log.Printf("serving tile from s3: %#v", tile)
 		}
 
 		// Truncate to match the request
