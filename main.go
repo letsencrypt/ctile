@@ -47,14 +47,30 @@ func parseQueryParams(values url.Values) (int64, int64, error) {
 	return startInt, endInt, nil
 }
 
+// tile represents important numbers about a tile: where it starts, where it ends, its size,
+// and what CT backend URL it exists on (or is anticipated to exist on).
 type tile struct {
-	start int64
-	end   int64
-	size  int64
+	start   int64
+	end     int64
+	size    int64
+	backend string
+}
+
+// makeTile returns a tile of size `size` that contains the given `start` position.
+// The resulting tile's `start` will be equal to or less than the requested `start`.
+func makeTile(start, size int64, backend string) tile {
+	tileOffset := start % size
+	tileStart := start - tileOffset
+	return tile{
+		start:   tileStart,
+		end:     tileStart + size,
+		size:    size,
+		backend: backend,
+	}
 }
 
 func (t tile) key() string {
-	return fmt.Sprintf("%d.cbor.gz", t.start)
+	return fmt.Sprintf("%s/tile_size=%d/%d.cbor.gz", t.backend, t.size, t.start)
 }
 
 type entry struct {
@@ -66,23 +82,13 @@ type entries struct {
 	Entries []entry `json:"entries"`
 }
 
-func makeTile(start, end, size int64) tile {
-	tileOffset := start % size
-	tileStart := start - tileOffset
-	return tile{
-		start: tileStart,
-		end:   tileStart + size,
-		size:  size,
-	}
-}
-
 // getTileFromBackend fetches a tile of entries from the backend, of size tileSize.
 //
 // The returned start value represents the start of the tile, and is guaranteed to
 // be equal or less than the requested start. The returned end value represents the
 // end of the tile, and is guaranteed to be `start + tileSize`.
-func getTileFromBackend(ctx context.Context, base, path string, t tile) (*entries, error) {
-	url := fmt.Sprintf("%s/%s?start=%d&end=%d", base, path, t.start, t.end)
+func getTileFromBackend(ctx context.Context, path string, t tile) (*entries, error) {
+	url := fmt.Sprintf("%s/%s?start=%d&end=%d", t.backend, path, t.start, t.end)
 	r, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create backend Request object: %s", err)
@@ -214,11 +220,11 @@ func main() {
 			return
 		}
 
-		tile := makeTile(start, end, int64(*tileSize))
+		tile := makeTile(start, int64(*tileSize), *backend)
 
 		contents, err := getFromS3(r.Context(), svc, *s3bucket, tile)
 		if err != nil && errors.Is(err, noSuchKey{}) {
-			contents, err = getTileFromBackend(r.Context(), *backend, r.URL.Path, tile)
+			contents, err = getTileFromBackend(r.Context(), r.URL.Path, tile)
 			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				fmt.Fprintln(w, err)
