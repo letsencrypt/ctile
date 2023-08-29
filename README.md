@@ -7,10 +7,10 @@ Regardless of what `start` and `end` parameters CTile receives for a request, it
 will transform those into a tile-sized request to its backend, by rounding down
 `start` to the nearest multiple of N and requesting exactly N items from the
 backend. If the request is successful, CTile checks that the response contains
-exactly N items, and stores the JSON in S3. It then returns modified JSON to the
-user, removing items from the head and tail to ensure that the first entry
-actually corresponds to the first entry requested by the user and that the
-response includes at most as many entries as requested.
+exactly N items, re-encodes as gzipped CBOR, and stores the result in S3. It then
+returns modified JSON to the user, removing items from the head and tail to ensure
+that the first entry actually corresponds to the first entry requested by the user
+and that the response includes at most as many entries as requested.
 
 When looking up entries in the cache, CTile also rounds `start` down to the
 nearest multiple of N, and requests a single tile from the S3 backend. The CT
