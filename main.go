@@ -117,6 +117,11 @@ func writeToS3(svc *s3.S3, bucket string, t tile, e *entries) error {
 		return nil
 	}
 
+	err = w.Close()
+	if err != nil {
+		return fmt.Errorf("closing gzip writer: %s", err)
+	}
+
 	key := t.key()
 	ctx := context.TODO()
 	_, err = svc.PutObjectWithContext(ctx, &s3.PutObjectInput{
