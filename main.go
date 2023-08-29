@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -183,16 +184,23 @@ func main() {
 	s3bucket := flag.String("s3-bucket", "", "s3 bucket to use for caching")
 	listenAddress := flag.String("listen-address", ":8080", "address to listen on")
 
+	// fullRequestTimeout is the max allowed time the handler can read from S3 and return or read from S3, read from backend, write to S3, and return.
+	fullRequestTimeout := flag.Duration("full-request-timeout", 4*time.Second, "max time to spend in the HTTP handler")
+
 	flag.Parse()
 
 	if *s3bucket == "" {
 		log.Fatal("missing required flag: -s3-bucket")
 	}
 
+	if *fullRequestTimeout == 0 {
+		log.Fatal("-full-request-timeout may not have a timeout value of 0")
+	}
+
 	sess := session.Must(session.NewSession())
 	svc := s3.New(sess)
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	var handler http.HandlerFunc = func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/ct/v1/get-entries") {
 			w.WriteHeader(http.StatusNotFound)
 			fmt.Fprintf(w, "invalid path %q\n", r.URL.Path)
@@ -260,7 +268,16 @@ func main() {
 		encoder := json.NewEncoder(w)
 		encoder.SetIndent("", "  ")
 		encoder.Encode(contents)
-	})
+	}
 
-	log.Fatal(http.ListenAndServe(*listenAddress, nil))
+	srv := http.Server{
+		Addr:              *listenAddress,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      *fullRequestTimeout + 1*time.Second, // must be a bit larger than than than the max time spent in the HTTP handler
+		IdleTimeout:       5 * time.Minute,
+		ReadHeaderTimeout: 2 * time.Second,
+		Handler:           http.TimeoutHandler(handler, *fullRequestTimeout, "full request timeout"),
+	}
+
+	log.Fatal(srv.ListenAndServe())
 }
