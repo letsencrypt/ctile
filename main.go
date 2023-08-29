@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -13,13 +14,10 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 )
-
-const backend = "https://oak.ct.letsencrypt.org"
-const tileSize = 256
-const s3bucket = "oak-crud-net"
 
 // parseQueryParams returns the start and end values, or an error.
 func parseQueryParams(values url.Values) (int64, int64, error) {
@@ -58,12 +56,12 @@ type entries struct {
 }
 
 func makeTile(start, end, size int64) tile {
-	tileOffset := start % tileSize
+	tileOffset := start % size
 	tileStart := start - tileOffset
 	return tile{
 		start: tileStart,
-		end:   tileStart + tileSize,
-		size:  tileSize,
+		end:   tileStart + size,
+		size:  size,
 	}
 }
 
@@ -89,15 +87,15 @@ func getTileFromBackend(base, path string, t tile) (*entries, error) {
 		return nil, fmt.Errorf("reading body from %s: %s", url, err)
 	}
 
-	if len(entries.Entries) > int(tileSize) || len(entries.Entries) == 0 {
-		return nil, fmt.Errorf("expected %d entries, got %d", tileSize, len(entries.Entries))
+	if len(entries.Entries) > int(t.size) || len(entries.Entries) == 0 {
+		return nil, fmt.Errorf("expected %d entries, got %d", t.size, len(entries.Entries))
 	}
 
 	return &entries, nil
 }
 
 // writeToS3 stores the entries corresponding to the given tile in s3.
-func writeToS3(svc *s3.S3, t tile, e *entries) error {
+func writeToS3(svc *s3.S3, bucket string, t tile, e *entries) error {
 	if len(e.Entries) != int(t.size) || t.end != t.start+t.size {
 		return fmt.Errorf("internal inconsistency: len(entries) == %d; tile = %v", len(e.Entries), t)
 	}
@@ -110,30 +108,42 @@ func writeToS3(svc *s3.S3, t tile, e *entries) error {
 	key := fmt.Sprintf("%d", t.start)
 	ctx := context.TODO()
 	_, err = svc.PutObjectWithContext(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(s3bucket),
+		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 		Body:   bytes.NewReader(body),
 	})
 	if err != nil {
-		return fmt.Errorf("putting in bucket %q with key %q: %s", s3bucket, key, err)
+		return fmt.Errorf("putting in bucket %q with key %q: %s", bucket, key, err)
 	}
 	return nil
 }
 
+// noSuchKey indicates the requested key does not exist.
+type noSuchKey struct{}
+
+func (noSuchKey) Error() string {
+	return "no such key"
+}
+
 // getFromS3 retrieves the entries corresponding to the given tile from s3.
-func getFromS3(svc *s3.S3, t tile) (*entries, error) {
+// If the tile isn't already stored in s3, it returns a noSuchKey error.
+func getFromS3(svc *s3.S3, bucket string, t tile) (*entries, error) {
+	key := fmt.Sprintf("%d", t.start)
 	resp, err := svc.GetObject(&s3.GetObjectInput{
-		Bucket: aws.String(s3bucket),
-		Key:    aws.String(fmt.Sprintf("%d", t.start)),
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("getting from bucket %q with key %q: %s", s3bucket, t.start, err)
+		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == s3.ErrCodeNoSuchKey {
+			return nil, noSuchKey{}
+		}
+		return nil, fmt.Errorf("getting from bucket %q with key %q: %s", bucket, key, err)
 	}
 
 	var entries entries
 	err = json.NewDecoder(resp.Body).Decode(&entries)
 	if err != nil {
-		return nil, fmt.Errorf("reading body from bucket %q with key %q: %s", s3bucket, t.start, err)
+		return nil, fmt.Errorf("reading body from bucket %q with key %q: %s", bucket, key, err)
 	}
 
 	if len(entries.Entries) != int(t.size) || t.end != t.start+t.size {
@@ -144,6 +154,16 @@ func getFromS3(svc *s3.S3, t tile) (*entries, error) {
 }
 
 func main() {
+	backend := flag.String("backend", "https://oak.ct.letsencrypt.org/2023", "backend URL")
+	tileSize := flag.Int("tile-size", 256, "tile size. Must match the value used by the backend.")
+	s3bucket := flag.String("s3-bucket", "", "s3 bucket to use for caching")
+
+	flag.Parse()
+
+	if *s3bucket == "" {
+		log.Fatal("missing required flag: -s3-bucket")
+	}
+
 	sess := session.Must(session.NewSession())
 	svc := s3.New(sess)
 
@@ -161,20 +181,24 @@ func main() {
 			return
 		}
 
-		tile := makeTile(start, end, tileSize)
+		tile := makeTile(start, end, int64(*tileSize))
 
-		contents, err := getFromS3(svc, tile)
-		if err != nil {
-			contents, err = getTileFromBackend(backend, r.URL.Path, tile)
+		contents, err := getFromS3(svc, *s3bucket, tile)
+		if err != nil && errors.Is(err, noSuchKey{}) {
+			contents, err = getTileFromBackend(*backend, r.URL.Path, tile)
 			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				fmt.Fprintln(w, err)
 				return
 			}
 
-			if len(contents.Entries) == tileSize {
-				err := writeToS3(svc, tile, contents)
+			if len(contents.Entries) == *tileSize {
+				err := writeToS3(svc, *s3bucket, tile, contents)
 				if err != nil {
+					// TODO: This should log the error but not return it to the user.
+					// In particular, errors due to the contents being less than a full
+					// tile in size should be ignored, since that will commonly happen when
+					// requesting ranges near the current end of the log.
 					w.WriteHeader(http.StatusInternalServerError)
 					fmt.Fprintf(w, "writing to s3: %s\n", err)
 					return
@@ -182,6 +206,10 @@ func main() {
 			}
 
 			w.Header().Set("X-Source", "CT log")
+		} else if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, "reading from s3: %s\n", err)
+			return
 		} else {
 			w.Header().Set("X-Source", "S3")
 		}
@@ -194,6 +222,9 @@ func main() {
 		if len(contents.Entries) > int(requestedLen) {
 			contents.Entries = contents.Entries[:requestedLen]
 		}
+
+		w.Header().Set("X-Response-Len", fmt.Sprintf("%d", len(contents.Entries)))
+		w.WriteHeader(http.StatusOK)
 
 		encoder := json.NewEncoder(w)
 		encoder.SetIndent("", "  ")
