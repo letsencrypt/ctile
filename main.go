@@ -80,9 +80,13 @@ func makeTile(start, end, size int64) tile {
 // The returned start value represents the start of the tile, and is guaranteed to
 // be equal or less than the requested start. The returned end value represents the
 // end of the tile, and is guaranteed to be `start + tileSize`.
-func getTileFromBackend(base, path string, t tile) (*entries, error) {
+func getTileFromBackend(ctx context.Context, base, path string, t tile) (*entries, error) {
 	url := fmt.Sprintf("%s/%s?start=%d&end=%d", base, path, t.start, t.end)
-	resp, err := http.Get(url)
+	r, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create backend Request object: %s", err)
+	}
+	resp, err := http.DefaultClient.Do(r)
 	if err != nil {
 		return nil, fmt.Errorf("fetching %s: %s", url, err)
 	}
@@ -105,7 +109,7 @@ func getTileFromBackend(base, path string, t tile) (*entries, error) {
 }
 
 // writeToS3 stores the entries corresponding to the given tile in s3.
-func writeToS3(svc *s3.S3, bucket string, t tile, e *entries) error {
+func writeToS3(ctx context.Context, svc *s3.S3, bucket string, t tile, e *entries) error {
 	if len(e.Entries) != int(t.size) || t.end != t.start+t.size {
 		return fmt.Errorf("internal inconsistency: len(entries) == %d; tile = %v", len(e.Entries), t)
 	}
@@ -123,7 +127,6 @@ func writeToS3(svc *s3.S3, bucket string, t tile, e *entries) error {
 	}
 
 	key := t.key()
-	ctx := context.TODO()
 	_, err = svc.PutObjectWithContext(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -144,9 +147,9 @@ func (noSuchKey) Error() string {
 
 // getFromS3 retrieves the entries corresponding to the given tile from s3.
 // If the tile isn't already stored in s3, it returns a noSuchKey error.
-func getFromS3(svc *s3.S3, bucket string, t tile) (*entries, error) {
+func getFromS3(ctx context.Context, svc *s3.S3, bucket string, t tile) (*entries, error) {
 	key := t.key()
-	resp, err := svc.GetObject(&s3.GetObjectInput{
+	resp, err := svc.GetObjectWithContext(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 	})
@@ -205,9 +208,9 @@ func main() {
 
 		tile := makeTile(start, end, int64(*tileSize))
 
-		contents, err := getFromS3(svc, *s3bucket, tile)
+		contents, err := getFromS3(r.Context(), svc, *s3bucket, tile)
 		if err != nil && errors.Is(err, noSuchKey{}) {
-			contents, err = getTileFromBackend(*backend, r.URL.Path, tile)
+			contents, err = getTileFromBackend(r.Context(), *backend, r.URL.Path, tile)
 			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				fmt.Fprintln(w, err)
@@ -215,7 +218,7 @@ func main() {
 			}
 
 			if len(contents.Entries) == *tileSize {
-				err := writeToS3(svc, *s3bucket, tile, contents)
+				err := writeToS3(r.Context(), svc, *s3bucket, tile, contents)
 				if err != nil {
 					// TODO: This should log the error but not return it to the user.
 					// In particular, errors due to the contents being less than a full
