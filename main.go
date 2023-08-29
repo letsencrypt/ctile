@@ -157,6 +157,7 @@ func main() {
 	backend := flag.String("backend", "https://oak.ct.letsencrypt.org/2023", "backend URL")
 	tileSize := flag.Int("tile-size", 256, "tile size. Must match the value used by the backend.")
 	s3bucket := flag.String("s3-bucket", "", "s3 bucket to use for caching")
+	listenAddress := flag.String("listen-address", ":8080", "address to listen on")
 
 	flag.Parse()
 
@@ -231,5 +232,5 @@ func main() {
 		encoder.Encode(contents)
 	})
 
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(http.ListenAndServe(*listenAddress, nil))
 }
