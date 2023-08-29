@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+
+	"github.com/fxamacker/cbor/v2"
 )
 
 // parseQueryParams returns the start and end values, or an error.
@@ -37,6 +40,9 @@ func parseQueryParams(values url.Values) (int64, int64, error) {
 	if err != nil || endInt < 0 {
 		return 0, 0, errors.New("invalid end parameter")
 	}
+	if endInt <= startInt {
+		return 0, 0, errors.New("end must be greater than start")
+	}
 	return startInt, endInt, nil
 }
 
@@ -46,9 +52,13 @@ type tile struct {
 	size  int64
 }
 
+func (t tile) key() string {
+	return fmt.Sprintf("%d.cbor.gz", t.start)
+}
+
 type entry struct {
-	LeafInput string `json:"leaf_input"`
-	ExtraData string `json:"extra_data"`
+	LeafInput []byte `json:"leaf_input"`
+	ExtraData []byte `json:"extra_data"`
 }
 
 type entries struct {
@@ -100,17 +110,19 @@ func writeToS3(svc *s3.S3, bucket string, t tile, e *entries) error {
 		return fmt.Errorf("internal inconsistency: len(entries) == %d; tile = %v", len(e.Entries), t)
 	}
 
-	body, err := json.Marshal(e)
+	var body bytes.Buffer
+	w := gzip.NewWriter(&body)
+	err := cbor.NewEncoder(w).Encode(e)
 	if err != nil {
 		return nil
 	}
 
-	key := fmt.Sprintf("%d", t.start)
+	key := t.key()
 	ctx := context.TODO()
 	_, err = svc.PutObjectWithContext(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
-		Body:   bytes.NewReader(body),
+		Body:   bytes.NewReader(body.Bytes()),
 	})
 	if err != nil {
 		return fmt.Errorf("putting in bucket %q with key %q: %s", bucket, key, err)
@@ -128,7 +140,7 @@ func (noSuchKey) Error() string {
 // getFromS3 retrieves the entries corresponding to the given tile from s3.
 // If the tile isn't already stored in s3, it returns a noSuchKey error.
 func getFromS3(svc *s3.S3, bucket string, t tile) (*entries, error) {
-	key := fmt.Sprintf("%d", t.start)
+	key := t.key()
 	resp, err := svc.GetObject(&s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -141,7 +153,11 @@ func getFromS3(svc *s3.S3, bucket string, t tile) (*entries, error) {
 	}
 
 	var entries entries
-	err = json.NewDecoder(resp.Body).Decode(&entries)
+	gzipReader, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("making gzipReader: %s", err)
+	}
+	err = cbor.NewDecoder(gzipReader).Decode(&entries)
 	if err != nil {
 		return nil, fmt.Errorf("reading body from bucket %q with key %q: %s", bucket, key, err)
 	}
@@ -226,6 +242,12 @@ func main() {
 
 		w.Header().Set("X-Response-Len", fmt.Sprintf("%d", len(contents.Entries)))
 		w.WriteHeader(http.StatusOK)
+
+		if r.URL.Query().Get("format") == "cbor" {
+			encoder := cbor.NewEncoder(w)
+			encoder.Encode(contents)
+			return
+		}
 
 		encoder := json.NewEncoder(w)
 		encoder.SetIndent("", "  ")
