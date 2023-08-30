@@ -269,17 +269,18 @@ func main() {
 				return
 			}
 
+			// If we go a partial tile, assume we are at the end of the log and the last
+			// tile isn't filled up yet. In that case, don't write to S3, but still return
+			// results to the user.
 			if len(contents.Entries) == *tileSize {
 				err := writeToS3(r.Context(), svc, *s3bucket, tile, contents)
 				if err != nil {
-					// TODO: This should log the error but not return it to the user.
-					// In particular, errors due to the contents being less than a full
-					// tile in size should be ignored, since that will commonly happen when
-					// requesting ranges near the current end of the log.
 					w.WriteHeader(http.StatusInternalServerError)
 					fmt.Fprintf(w, "writing to s3: %s\n", err)
 					return
 				}
+			} else {
+				w.Header().Set("X-Partial-Tile", "true")
 			}
 
 			w.Header().Set("X-Source", "CT log")
