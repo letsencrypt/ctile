@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -48,45 +49,68 @@ func parseQueryParams(values url.Values) (int64, int64, error) {
 }
 
 // tile represents important numbers about a tile: where it starts, where it ends, its size,
-// and what CT backend URL it exists on (or is anticipated to exist on).
+// and what CT backend URL it exists on (or is anticipated to exist on), and what s3 prefix
+// it should be stored/retrieved under.
 type tile struct {
-	start   int64
-	end     int64
-	size    int64
-	backend string
+	start    int64
+	end      int64
+	size     int64
+	backend  string
+	s3prefix string
 }
 
 // makeTile returns a tile of size `size` that contains the given `start` position.
 // The resulting tile's `start` will be equal to or less than the requested `start`.
-func makeTile(start, size int64, backend string) tile {
+func makeTile(start, size int64, backend string, s3prefix string) tile {
 	tileOffset := start % size
 	tileStart := start - tileOffset
 	return tile{
-		start:   tileStart,
-		end:     tileStart + size,
-		size:    size,
-		backend: backend,
+		start:    tileStart,
+		end:      tileStart + size,
+		size:     size,
+		backend:  backend,
+		s3prefix: s3prefix,
 	}
 }
 
+// key returns the S3 key for the tile.
 func (t tile) key() string {
-	return fmt.Sprintf("%s/tile_size=%d/%d.cbor.gz", t.backend, t.size, t.start)
+	return fmt.Sprintf("%s/tile_size=%d/%d.cbor.gz", t.s3prefix, t.size, t.start)
 }
 
+// entries corresponds to the JSON response to the CT get-entries endpoint.
+// https://datatracker.ietf.org/doc/html/rfc6962#section-4.6
+//
+// It is marshaled and unmarshaled to/from JSON and CBOR.
+type entries struct {
+	Entries []entry `json:"entries"`
+}
+
+// entry corresponds to a single entry in the CT get-entries endpoint.
+//
+// Note: the JSON fields are base64. For fields of type `[]byte`, Go's encoding/json
+// automagically decodes base64.
 type entry struct {
 	LeafInput []byte `json:"leaf_input"`
 	ExtraData []byte `json:"extra_data"`
 }
 
-type entries struct {
-	Entries []entry `json:"entries"`
+// statusCodeError indicates the backend returned a non-200 status code, and contains
+// the response body. This allows passing through that status code and body to the requester.
+type statusCodeError struct {
+	statusCode int
+	body       []byte
 }
 
-// getTileFromBackend fetches a tile of entries from the backend, of size tileSize.
+func (s statusCodeError) Error() string {
+	return fmt.Sprintf("backend responded with status code %d and body:\n%s", s.statusCode, string(s.body))
+}
+
+// getTileFromBackend fetches a tile of entries from the backend.
 //
-// The returned start value represents the start of the tile, and is guaranteed to
-// be equal or less than the requested start. The returned end value represents the
-// end of the tile, and is guaranteed to be `start + tileSize`.
+// If the backend returns a non-200 status code, it returns a statusCodeError,
+// so the caller can handle that case specially by propagating the backend's
+// status code (for instance, 400 or 404).
 func getTileFromBackend(ctx context.Context, path string, t tile) (*entries, error) {
 	url := fmt.Sprintf("%s/%s?start=%d&end=%d", t.backend, path, t.start, t.end)
 	r, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -99,7 +123,11 @@ func getTileFromBackend(ctx context.Context, path string, t tile) (*entries, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetching %s: status code %d", url, resp.StatusCode)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("reading body from %s: %s", url, err)
+		}
+		return nil, statusCodeError{resp.StatusCode, body}
 	}
 
 	var entries entries
@@ -186,8 +214,9 @@ func getFromS3(ctx context.Context, svc *s3.S3, bucket string, t tile) (*entries
 
 func main() {
 	backend := flag.String("backend", "https://oak.ct.letsencrypt.org/2023", "backend URL")
-	tileSize := flag.Int("tile-size", 256, "tile size. Must match the value used by the backend.")
+	tileSize := flag.Int("tile-size", 256, "tile size. Must match the value used by the backend")
 	s3bucket := flag.String("s3-bucket", "", "s3 bucket to use for caching")
+	s3prefix := flag.String("s3-prefix", "", "prefix for s3 keys. defaults to value of -backend")
 	listenAddress := flag.String("listen-address", ":8080", "address to listen on")
 
 	// fullRequestTimeout is the max allowed time the handler can read from S3 and return or read from S3, read from backend, write to S3, and return.
@@ -201,6 +230,10 @@ func main() {
 
 	if *fullRequestTimeout == 0 {
 		log.Fatal("-full-request-timeout may not have a timeout value of 0")
+	}
+
+	if *s3prefix == "" {
+		*s3prefix = *backend
 	}
 
 	sess := session.Must(session.NewSession())
@@ -220,13 +253,18 @@ func main() {
 			return
 		}
 
-		tile := makeTile(start, int64(*tileSize), *backend)
+		tile := makeTile(start, int64(*tileSize), *backend, *s3prefix)
 
 		contents, err := getFromS3(r.Context(), svc, *s3bucket, tile)
 		if err != nil && errors.Is(err, noSuchKey{}) {
 			contents, err = getTileFromBackend(r.Context(), r.URL.Path, tile)
 			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
+				status := http.StatusInternalServerError
+				var statusCodeErr statusCodeError
+				if errors.As(err, &statusCodeErr) {
+					status = statusCodeErr.statusCode
+				}
+				w.WriteHeader(status)
 				fmt.Fprintln(w, err)
 				return
 			}
