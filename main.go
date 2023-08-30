@@ -20,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/fxamacker/cbor/v2"
 )
@@ -221,6 +222,8 @@ type tileCachingHandler struct {
 	s3Service *s3.S3 // The S3 service to use for caching tiles. Must not be nil.
 	s3Prefix  string // The prefix to add to the path when caching tiles in S3. Must not be empty.
 	s3Bucket  string // The S3 bucket to use for caching tiles. Must not be empty.
+
+	cacheGroup *singleflight.Group
 }
 
 func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -238,43 +241,22 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 
 	tile := makeTile(start, int64(tch.tileSize), tch.logURL, tch.s3Prefix)
-
-	contents, err := getFromS3(r.Context(), tch.s3Service, tch.s3Bucket, tile)
-	if err != nil && errors.Is(err, noSuchKey{}) {
-		contents, err = getTileFromBackend(r.Context(), r.URL.Path, tile)
-		if err != nil {
-			status := http.StatusInternalServerError
-			var statusCodeErr statusCodeError
-			if errors.As(err, &statusCodeErr) {
-				status = statusCodeErr.statusCode
-			}
-			w.WriteHeader(status)
-			fmt.Fprintln(w, err)
-			return
+	contents, source, err := tch.fetchAndCacheTile(r.Context(), r.URL.Path, tile)
+	if err != nil {
+		status := http.StatusInternalServerError
+		var statusCodeErr statusCodeError
+		if errors.As(err, &statusCodeErr) {
+			status = statusCodeErr.statusCode
 		}
-
-		// If we go a partial tile, assume we are at the end of the log and the last
-		// tile isn't filled up yet. In that case, don't write to S3, but still return
-		// results to the user.
-		if len(contents.Entries) == tch.tileSize {
-			err := writeToS3(r.Context(), tch.s3Service, tch.s3Bucket, tile, contents)
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				fmt.Fprintf(w, "writing to s3: %s\n", err)
-				return
-			}
-		} else {
-			w.Header().Set("X-Partial-Tile", "true")
-		}
-
-		w.Header().Set("X-Source", "CT log")
-	} else if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "reading from s3: %s\n", err)
+		w.WriteHeader(status)
+		fmt.Fprintln(w, err)
 		return
-	} else {
-		w.Header().Set("X-Source", "S3")
 	}
+	if len(contents.Entries) != tch.tileSize {
+		w.Header().Set("X-Partial-Tile", "true")
+	}
+
+	w.Header().Set("X-Source", string(source))
 
 	// Truncate to match the request
 	prefixToRemove := start - tile.start
@@ -291,6 +273,68 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
 	encoder.Encode(contents)
+}
+
+// Source is the public name of the storage system a tile was returned from and
+// is set in the X-Partial-Tile header
+type Source string
+
+const (
+	CTLogSource Source = "CT log"
+	S3Source    Source = "S3"
+)
+
+func (tch *tileCachingHandler) fetchAndCacheTile(ctx context.Context, path string, tile tile) (*entries, Source, error) {
+	dedupKey := fmt.Sprintf("logURL-%s-path-%s-tile-%d-%d", tile.logURL, path, tile.start, tile.end)
+
+	type entriesAndSource struct {
+		entries *entries
+		source  Source
+	}
+
+	innerContents, err, _ := singleflightDo(tch.cacheGroup, dedupKey, func() (*entriesAndSource, error) {
+		contents, source, err := tch.fetchAndCacheTileNoDedup(ctx, path, tile)
+		if err != nil {
+			return nil, err
+		}
+		return &entriesAndSource{contents, source}, nil
+	})
+	return innerContents.entries, innerContents.source, err
+}
+
+func (tch *tileCachingHandler) fetchAndCacheTileNoDedup(ctx context.Context, path string, tile tile) (*entries, Source, error) {
+	contents, err := getFromS3(ctx, tch.s3Service, tch.s3Bucket, tile)
+	if err == nil {
+		return contents, S3Source, nil
+	}
+	if !errors.Is(err, noSuchKey{}) {
+		return nil, S3Source, err
+	}
+	contents, err = getTileFromBackend(ctx, path, tile)
+	if err != nil {
+		return nil, CTLogSource, err
+	}
+	// If we got a partial tile, assume we are at the end of the log and the
+	// last tile isn't filled up yet. In that case, don't write to S3, but
+	// still return results to the user.
+	if len(contents.Entries) == tch.tileSize {
+		err := writeToS3(ctx, tch.s3Service, tch.s3Bucket, tile, contents)
+		if err != nil {
+			return nil, CTLogSource, fmt.Errorf("writing to s3: %w", err)
+		}
+	}
+	return contents, CTLogSource, nil
+
+}
+
+// singleflightDo is a wrapper around singleflight.Group.Do that, instead of
+// returning an interface{}, returns the exact type of the first return type of
+// the function fn. (singleflight was built before generics)
+func singleflightDo[V any](group *singleflight.Group, key string, fn func() (V, error)) (V, error, bool) {
+	out, err, shared := group.Do(key, func() (interface{}, error) {
+		return fn()
+	})
+	return out.(V), err, shared
 }
 
 func main() {
@@ -329,11 +373,12 @@ func main() {
 	svc := s3.New(sess)
 
 	handler := &tileCachingHandler{
-		logURL:    *logURL,
-		tileSize:  *tileSize,
-		s3Service: svc,
-		s3Prefix:  *s3prefix,
-		s3Bucket:  *s3bucket,
+		logURL:     *logURL,
+		tileSize:   *tileSize,
+		s3Service:  svc,
+		s3Prefix:   *s3prefix,
+		s3Bucket:   *s3bucket,
+		cacheGroup: &singleflight.Group{},
 	}
 
 	srv := http.Server{
