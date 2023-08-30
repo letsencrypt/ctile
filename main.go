@@ -55,7 +55,7 @@ type tile struct {
 	start    int64
 	end      int64
 	size     int64
-	backend  string
+	logURL   string
 	s3prefix string
 }
 
@@ -68,7 +68,7 @@ func makeTile(start, size int64, backend string, s3prefix string) tile {
 		start:    tileStart,
 		end:      tileStart + size,
 		size:     size,
-		backend:  backend,
+		logURL:   backend,
 		s3prefix: s3prefix,
 	}
 }
@@ -112,7 +112,7 @@ func (s statusCodeError) Error() string {
 // so the caller can handle that case specially by propagating the backend's
 // status code (for instance, 400 or 404).
 func getTileFromBackend(ctx context.Context, path string, t tile) (*entries, error) {
-	url := fmt.Sprintf("%s/%s?start=%d&end=%d", t.backend, path, t.start, t.end)
+	url := fmt.Sprintf("%s/%s?start=%d&end=%d", t.logURL, path, t.start, t.end)
 	r, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create backend Request object: %s", err)
@@ -213,8 +213,8 @@ func getFromS3(ctx context.Context, svc *s3.S3, bucket string, t tile) (*entries
 }
 
 func main() {
-	backend := flag.String("backend", "https://oak.ct.letsencrypt.org/2023", "backend URL")
-	tileSize := flag.Int("tile-size", 256, "tile size. Must match the value used by the backend")
+	logURL := flag.String("log-url", "", "CT log URL. e.g. https://oak.ct.letsencrypt.org/2023")
+	tileSize := flag.Int("tile-size", 0, "tile size. Must match the value used by the backend")
 	s3bucket := flag.String("s3-bucket", "", "s3 bucket to use for caching")
 	s3prefix := flag.String("s3-prefix", "", "prefix for s3 keys. defaults to value of -backend")
 	listenAddress := flag.String("listen-address", ":8080", "address to listen on")
@@ -224,8 +224,16 @@ func main() {
 
 	flag.Parse()
 
+	if *logURL == "" {
+		log.Fatal("missing required flag: -log-url")
+	}
+
 	if *s3bucket == "" {
 		log.Fatal("missing required flag: -s3-bucket")
+	}
+
+	if *tileSize == 0 {
+		log.Fatal("missing required flag: -tile-size")
 	}
 
 	if *fullRequestTimeout == 0 {
@@ -233,7 +241,7 @@ func main() {
 	}
 
 	if *s3prefix == "" {
-		*s3prefix = *backend
+		*s3prefix = *logURL
 	}
 
 	sess := session.Must(session.NewSession())
@@ -253,7 +261,7 @@ func main() {
 			return
 		}
 
-		tile := makeTile(start, int64(*tileSize), *backend, *s3prefix)
+		tile := makeTile(start, int64(*tileSize), *logURL, *s3prefix)
 
 		contents, err := getFromS3(r.Context(), svc, *s3bucket, tile)
 		if err != nil && errors.Is(err, noSuchKey{}) {
