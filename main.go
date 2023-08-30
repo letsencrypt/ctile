@@ -16,10 +16,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/fxamacker/cbor/v2"
 )
@@ -144,7 +144,7 @@ func getTileFromBackend(ctx context.Context, path string, t tile) (*entries, err
 }
 
 // writeToS3 stores the entries corresponding to the given tile in s3.
-func writeToS3(ctx context.Context, svc *s3.S3, bucket string, t tile, e *entries) error {
+func writeToS3(ctx context.Context, svc *s3.Client, bucket string, t tile, e *entries) error {
 	if len(e.Entries) != int(t.size) || t.end != t.start+t.size {
 		return fmt.Errorf("internal inconsistency: len(entries) == %d; tile = %v", len(e.Entries), t)
 	}
@@ -162,7 +162,7 @@ func writeToS3(ctx context.Context, svc *s3.S3, bucket string, t tile, e *entrie
 	}
 
 	key := t.key()
-	_, err = svc.PutObjectWithContext(ctx, &s3.PutObjectInput{
+	_, err = svc.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 		Body:   bytes.NewReader(body.Bytes()),
@@ -182,14 +182,14 @@ func (noSuchKey) Error() string {
 
 // getFromS3 retrieves the entries corresponding to the given tile from s3.
 // If the tile isn't already stored in s3, it returns a noSuchKey error.
-func getFromS3(ctx context.Context, svc *s3.S3, bucket string, t tile) (*entries, error) {
+func getFromS3(ctx context.Context, svc *s3.Client, bucket string, t tile) (*entries, error) {
 	key := t.key()
-	resp, err := svc.GetObjectWithContext(ctx, &s3.GetObjectInput{
+	resp, err := svc.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == s3.ErrCodeNoSuchKey {
+		if errors.Is(err, &types.NotFound{}) {
 			return nil, noSuchKey{}
 		}
 		return nil, fmt.Errorf("getting from bucket %q with key %q: %s", bucket, key, err)
@@ -218,9 +218,9 @@ type tileCachingHandler struct {
 	logURL   string // The string form of the HTTP host and path prefix to add incoming request paths to in order to fetch tiles from the backing CT log. Must not be empty.
 	tileSize int    // The CT tile size used here and in the given backend. Must not be zero.
 
-	s3Service *s3.S3 // The S3 service to use for caching tiles. Must not be nil.
-	s3Prefix  string // The prefix to add to the path when caching tiles in S3. Must not be empty.
-	s3Bucket  string // The S3 bucket to use for caching tiles. Must not be empty.
+	s3Service *s3.Client // The S3 service to use for caching tiles. Must not be nil.
+	s3Prefix  string     // The prefix to add to the path when caching tiles in S3. Must not be empty.
+	s3Bucket  string     // The S3 bucket to use for caching tiles. Must not be empty.
 }
 
 func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -253,7 +253,7 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			return
 		}
 
-		// If we go a partial tile, assume we are at the end of the log and the last
+		// If we got a partial tile, assume we are at the end of the log and the last
 		// tile isn't filled up yet. In that case, don't write to S3, but still return
 		// results to the user.
 		if len(contents.Entries) == tch.tileSize {
@@ -325,8 +325,11 @@ func main() {
 		*s3prefix = *logURL
 	}
 
-	sess := session.Must(session.NewSession())
-	svc := s3.New(sess)
+	cfg, err := config.LoadDefaultConfig(context.Background())
+	if err != nil {
+		log.Fatal(err)
+	}
+	svc := s3.NewFromConfig(cfg)
 
 	handler := &tileCachingHandler{
 		logURL:    *logURL,
