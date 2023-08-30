@@ -212,6 +212,87 @@ func getFromS3(ctx context.Context, svc *s3.S3, bucket string, t tile) (*entries
 	return &entries, nil
 }
 
+// tileCachingHandler is the main HTTP handler that serves CT tiles it fetches
+// from a backend server and from the cache tiles it maintains in S3.
+type tileCachingHandler struct {
+	logURL   string // The string form of the HTTP host and path prefix to add incoming request paths to in order to fetch tiles from the backing CT log. Must not be empty.
+	tileSize int    // The CT tile size used here and in the given backend. Must not be zero.
+
+	s3Service *s3.S3 // The S3 service to use for caching tiles. Must not be nil.
+	s3Prefix  string // The prefix to add to the path when caching tiles in S3. Must not be empty.
+	s3Bucket  string // The S3 bucket to use for caching tiles. Must not be empty.
+}
+
+func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !strings.HasSuffix(r.URL.Path, "/ct/v1/get-entries") {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, "invalid path %q\n", r.URL.Path)
+		return
+	}
+
+	start, end, err := parseQueryParams(r.URL.Query())
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintln(w, err)
+		return
+	}
+
+	tile := makeTile(start, int64(tch.tileSize), tch.logURL, tch.s3Prefix)
+
+	contents, err := getFromS3(r.Context(), tch.s3Service, tch.s3Bucket, tile)
+	if err != nil && errors.Is(err, noSuchKey{}) {
+		contents, err = getTileFromBackend(r.Context(), r.URL.Path, tile)
+		if err != nil {
+			status := http.StatusInternalServerError
+			var statusCodeErr statusCodeError
+			if errors.As(err, &statusCodeErr) {
+				status = statusCodeErr.statusCode
+			}
+			w.WriteHeader(status)
+			fmt.Fprintln(w, err)
+			return
+		}
+
+		// If we go a partial tile, assume we are at the end of the log and the last
+		// tile isn't filled up yet. In that case, don't write to S3, but still return
+		// results to the user.
+		if len(contents.Entries) == tch.tileSize {
+			err := writeToS3(r.Context(), tch.s3Service, tch.s3Bucket, tile, contents)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprintf(w, "writing to s3: %s\n", err)
+				return
+			}
+		} else {
+			w.Header().Set("X-Partial-Tile", "true")
+		}
+
+		w.Header().Set("X-Source", "CT log")
+	} else if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "reading from s3: %s\n", err)
+		return
+	} else {
+		w.Header().Set("X-Source", "S3")
+	}
+
+	// Truncate to match the request
+	prefixToRemove := start - tile.start
+	contents.Entries = contents.Entries[prefixToRemove:]
+
+	requestedLen := end - start
+	if len(contents.Entries) > int(requestedLen) {
+		contents.Entries = contents.Entries[:requestedLen]
+	}
+
+	w.Header().Set("X-Response-Len", fmt.Sprintf("%d", len(contents.Entries)))
+	w.WriteHeader(http.StatusOK)
+
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	encoder.Encode(contents)
+}
+
 func main() {
 	logURL := flag.String("log-url", "", "CT log URL. e.g. https://oak.ct.letsencrypt.org/2023")
 	tileSize := flag.Int("tile-size", 0, "tile size. Must match the value used by the backend")
@@ -247,74 +328,12 @@ func main() {
 	sess := session.Must(session.NewSession())
 	svc := s3.New(sess)
 
-	var handler http.HandlerFunc = func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, "/ct/v1/get-entries") {
-			w.WriteHeader(http.StatusNotFound)
-			fmt.Fprintf(w, "invalid path %q\n", r.URL.Path)
-			return
-		}
-
-		start, end, err := parseQueryParams(r.URL.Query())
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			fmt.Fprintln(w, err)
-			return
-		}
-
-		tile := makeTile(start, int64(*tileSize), *logURL, *s3prefix)
-
-		contents, err := getFromS3(r.Context(), svc, *s3bucket, tile)
-		if err != nil && errors.Is(err, noSuchKey{}) {
-			contents, err = getTileFromBackend(r.Context(), r.URL.Path, tile)
-			if err != nil {
-				status := http.StatusInternalServerError
-				var statusCodeErr statusCodeError
-				if errors.As(err, &statusCodeErr) {
-					status = statusCodeErr.statusCode
-				}
-				w.WriteHeader(status)
-				fmt.Fprintln(w, err)
-				return
-			}
-
-			// If we go a partial tile, assume we are at the end of the log and the last
-			// tile isn't filled up yet. In that case, don't write to S3, but still return
-			// results to the user.
-			if len(contents.Entries) == *tileSize {
-				err := writeToS3(r.Context(), svc, *s3bucket, tile, contents)
-				if err != nil {
-					w.WriteHeader(http.StatusInternalServerError)
-					fmt.Fprintf(w, "writing to s3: %s\n", err)
-					return
-				}
-			} else {
-				w.Header().Set("X-Partial-Tile", "true")
-			}
-
-			w.Header().Set("X-Source", "CT log")
-		} else if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, "reading from s3: %s\n", err)
-			return
-		} else {
-			w.Header().Set("X-Source", "S3")
-		}
-
-		// Truncate to match the request
-		prefixToRemove := start - tile.start
-		contents.Entries = contents.Entries[prefixToRemove:]
-
-		requestedLen := end - start
-		if len(contents.Entries) > int(requestedLen) {
-			contents.Entries = contents.Entries[:requestedLen]
-		}
-
-		w.Header().Set("X-Response-Len", fmt.Sprintf("%d", len(contents.Entries)))
-		w.WriteHeader(http.StatusOK)
-
-		encoder := json.NewEncoder(w)
-		encoder.SetIndent("", "  ")
-		encoder.Encode(contents)
+	handler := &tileCachingHandler{
+		logURL:    *logURL,
+		tileSize:  *tileSize,
+		s3Service: svc,
+		s3Prefix:  *s3prefix,
+		s3Bucket:  *s3bucket,
 	}
 
 	srv := http.Server{
