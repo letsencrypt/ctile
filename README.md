@@ -28,3 +28,32 @@ because the requisite number of entries haven't been sequenced yet. In this
 case, CTile does not write anything to the S3 backend and simply passes
 through the entries returned from the server (after appropriate tweaks to match
 the start and end parameters from the user request).
+
+# How To
+
+You must have an S3 bucket set up, and AWS credentials for a role that has read
+and write access to that S3 bucket. CTile uses the AWS Go SDK with the default
+credential provider, and so will [pull credential
+information](https://docs.aws.amazon.com/sdk-for-go/v1/developer-guide/configuring-sdk.html#specifying-credentials)
+from environment variables, an AWS config file, or ambient credentials for an
+EC2 instance. You'll need to manually specify the AWS region for your S3 bucket
+by setting the environment variable AWS_REGION.
+
+You must also know the maximum get-entries size for the log you are mirroring.
+If you operate the log, you will know this from your own configs. Otherwise, you
+can figure it out by making a get-entries request with `end` much larger than
+`start`, and counting the entries. You should set CTile's tile-size to exactly
+equal this maximum. It's possible to set a tile-size lower, but only if the log
+is not using `align_getentries`.
+
+Example invocation:
+
+```
+export AWS_REGION=us-west-2
+go run . -log-url https://oak.ct.letsencrypt.org/2023 \
+    -tile-size 256 -s3-bucket some-bucket -full-request-timeout 30s -s3-prefix oak2023
+```
+
+```
+curl 'localhost:8080/ct/v1/get-entries?start=0&end=999999999' -i  | less
+```
