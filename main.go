@@ -304,12 +304,6 @@ func main() {
 		w.Header().Set("X-Response-Len", fmt.Sprintf("%d", len(contents.Entries)))
 		w.WriteHeader(http.StatusOK)
 
-		if r.URL.Query().Get("format") == "cbor" {
-			encoder := cbor.NewEncoder(w)
-			encoder.Encode(contents)
-			return
-		}
-
 		encoder := json.NewEncoder(w)
 		encoder.SetIndent("", "  ")
 		encoder.Encode(contents)
