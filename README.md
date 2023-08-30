@@ -25,7 +25,6 @@ equal to Trillian's max_get_entries flag.
 When a user requests a range of get-entries near the end of the log, CTile
 usually won't be able to get a full tile's worth of entries from the backend,
 because the requisite number of entries haven't been sequenced yet. In this
-case, CTile should not write anything to the S3 backend and should simply pass
+case, CTile does not write anything to the S3 backend and simply passes
 through the entries returned from the server (after appropriate tweaks to match
-the start and end parameters from the user request). This behavior still needs
-to be implemented.
+the start and end parameters from the user request).
