@@ -25,6 +25,10 @@ import (
 )
 
 // parseQueryParams returns the start and end values, or an error.
+//
+// The end value it returns is one greater than in the request,
+// because CT uses closed intervals while we use half-open intervals
+// internally for simpler math.
 func parseQueryParams(values url.Values) (int64, int64, error) {
 	start := values.Get("start")
 	end := values.Get("end")
@@ -42,17 +46,17 @@ func parseQueryParams(values url.Values) (int64, int64, error) {
 	if err != nil || endInt < 0 {
 		return 0, 0, fmt.Errorf("invalid end parameter: %w", err)
 	}
-	if endInt <= startInt {
-		return 0, 0, errors.New("end must be greater than start")
+	if endInt < startInt {
+		return 0, 0, errors.New("end must be greater than or equal to start")
 	}
-	return startInt, endInt, nil
+	return startInt, endInt + 1, nil
 }
 
 // tile represents important info about a tile: where it starts, where it ends, its size,
 // what CT backend URL it exists on (or is anticipated to exist on), and what s3 prefix
 // it should be stored/retrieved under.
 //
-// `start` is inclusive, and `end` is exclusive, just like in the CT protocol.
+// `start` is inclusive, and `end` is exclusive, unlike in the CT protocol.
 // In other words, they represent the half-open interval [start, end).
 type tile struct {
 	start  int64
@@ -81,7 +85,9 @@ func (t tile) key() string {
 
 // url returns the URL to fetch the tile from the backend.
 func (t tile) url() string {
-	return fmt.Sprintf("%s/ct/v1/get-entries?start=%d&end=%d", t.logURL, t.start, t.end)
+	// Use end-1 because our internal representation uses half-open intervals, while the
+	// CT protocol uses closed intervals. https://datatracker.ietf.org/doc/html/rfc6962#section-4.6
+	return fmt.Sprintf("%s/ct/v1/get-entries?start=%d&end=%d", t.logURL, t.start, t.end-1)
 }
 
 // entries corresponds to the JSON response to the CT get-entries endpoint.
@@ -289,7 +295,7 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		// In this case, the requested range is entirely outside the current log,
 		// but the _tile_'s beginning was inside the log. For instance, a log with
 		// size 1000 and max_getentries of 256, where ctile is handling a request
-		// for start=1001&end=1002; the tile starts at offset 768, but is partial so
+		// for start=1001&end=1001; the tile starts at offset 768, but is partial so
 		// it doesn't include the requested range.
 		//
 		// When Trillian gets a request that is past the end of the log, it returns

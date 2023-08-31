@@ -77,23 +77,24 @@ func TestIntegration(t *testing.T) {
 		endInt, _ := strconv.ParseInt(r.URL.Query().Get("end"), 10, 64)
 		var entries entries
 
-		// Behave as if the CT server has a max_get_entries limit of 3
-		if endInt-startInt > 3 {
-			endInt = startInt + 3
+		// Behave as if the CT server has a max_get_entries limit of 3.
+		// The +1 and -1 are because CT uses closed intervals.
+		if endInt-startInt+1 > 3 {
+			endInt = startInt + 3 - 1
 		}
 
 		// Behave as if the CT server has a total of 10 entries
-		if endInt > 10 {
-			endInt = 10
-		}
-
-		if endInt-startInt <= 0 {
+		if startInt > 10 {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte(testLogSaysPastTheEnd))
 			return
 		}
 
-		for i := startInt; i < endInt; i++ {
+		if endInt > 10 {
+			endInt = 10
+		}
+
+		for i := startInt; i <= endInt; i++ {
 			leafInput := make([]byte, 8)
 			binary.PutVarint(leafInput, i)
 			extraData := make([]byte, 8)
@@ -158,7 +159,7 @@ func TestIntegration(t *testing.T) {
 		"/ct/v1/get-entries?start=a&end=b",
 		"/ct/v1/get-entries?start=1&end=b",
 		"/ct/v1/get-entries?start=a&end=1",
-		"/ct/v1/get-entries?start=0&end=0",
+		"/ct/v1/get-entries?start=1&end=0",
 		"/ct/v1/get-entries?start=-1&end=1",
 		"/ct/v1/get-entries?start=1&end=-1",
 		"/ct/v1/get-entries?start=1",
@@ -172,7 +173,7 @@ func TestIntegration(t *testing.T) {
 	}
 
 	// Valid query; should 200
-	twoEntriesA, headers, err := getAndParseResp(t, ctile, "/ct/v1/get-entries?start=3&end=5")
+	twoEntriesA, headers, err := getAndParseResp(t, ctile, "/ct/v1/get-entries?start=3&end=4")
 	if err != nil {
 		t.Error(err)
 	}
@@ -184,7 +185,7 @@ func TestIntegration(t *testing.T) {
 	}
 
 	// Same query again; should come from S3 this time.
-	twoEntriesB, headers, err := getAndParseResp(t, ctile, "/ct/v1/get-entries?start=3&end=5")
+	twoEntriesB, headers, err := getAndParseResp(t, ctile, "/ct/v1/get-entries?start=3&end=4")
 	if err != nil {
 		t.Error(err)
 	}
@@ -202,7 +203,7 @@ func TestIntegration(t *testing.T) {
 
 	// The third entry in this first tile should also be served from S3 now, because it
 	// was pulled into cache by the previous requests.
-	oneEntry, headers, err := getAndParseResp(t, ctile, "/ct/v1/get-entries?start=5&end=6")
+	oneEntry, headers, err := getAndParseResp(t, ctile, "/ct/v1/get-entries?start=5&end=5")
 	if err != nil {
 		t.Error(err)
 	}
@@ -213,7 +214,7 @@ func TestIntegration(t *testing.T) {
 		t.Errorf("expected 1 entry got %d", len(oneEntry.Entries))
 	}
 
-	// Tiles fetched from the end of the log will be partial. Ctile should not cache.
+	// Tiles fetched from the end of the log will be partial. CTile should not cache.
 	_, headers, err = getAndParseResp(t, ctile, "/ct/v1/get-entries?start=9&end=11")
 	if err != nil {
 		t.Error(err)
@@ -264,6 +265,7 @@ func getResp(ctile tileCachingHandler, url string) *http.Response {
 }
 
 func getAndParseResp(t *testing.T, ctile tileCachingHandler, url string) (entries, http.Header, error) {
+	t.Helper()
 	resp := getResp(ctile, url)
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
@@ -275,6 +277,7 @@ func getAndParseResp(t *testing.T, ctile tileCachingHandler, url string) (entrie
 }
 
 func expectHeader(t *testing.T, headers http.Header, key, expected string) {
+	t.Helper()
 	if headers.Get(key) != expected {
 		t.Errorf("header %q: expected %q got %q", key, expected, headers.Get(key))
 	}
