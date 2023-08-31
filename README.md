@@ -20,7 +20,7 @@ not attempt to request multiple tiles to fulfil a large request. If a request's
 single entry. This is similar to how Trillian's [align_getentries
 flag](https://github.com/google/certificate-transparency-go/blob/6e118585d9d9757b739353829becec378f47e10b/trillian/ctfe/handlers.go#L50)
 works, and is in fact compatible with that flag, so long as CTile's tile size is
-equal to Trillian's max_get_entries flag.
+less than or equal to Trillian's max_get_entries flag.
 
 When a user requests a range of get-entries near the end of the log, CTile
 usually won't be able to get a full tile's worth of entries from the backend,
