@@ -189,20 +189,21 @@ func getFromS3(ctx context.Context, svc *s3.Client, bucket string, t tile) (*ent
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		if errors.Is(err, &types.NotFound{}) {
+		var nsk *types.NoSuchKey
+		if errors.As(err, &nsk) {
 			return nil, noSuchKey{}
 		}
-		return nil, fmt.Errorf("getting from bucket %q with key %q: %s", bucket, key, err)
+		return nil, fmt.Errorf("getting from bucket %q with key %q: %w", bucket, key, err)
 	}
 
 	var entries entries
 	gzipReader, err := gzip.NewReader(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("making gzipReader: %s", err)
+		return nil, fmt.Errorf("making gzipReader: %w", err)
 	}
 	err = cbor.NewDecoder(gzipReader).Decode(&entries)
 	if err != nil {
-		return nil, fmt.Errorf("reading body from bucket %q with key %q: %s", bucket, key, err)
+		return nil, fmt.Errorf("reading body from bucket %q with key %q: %w", bucket, key, err)
 	}
 
 	if len(entries.Entries) != int(t.size) || t.end != t.start+t.size {
