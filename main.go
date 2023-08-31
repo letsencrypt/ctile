@@ -279,7 +279,21 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 	// Truncate to match the request
 	prefixToRemove := start - tile.start
-	contents.Entries = contents.Entries[prefixToRemove:]
+	if prefixToRemove >= int64(len(contents.Entries)) {
+		// In this case, the requested range is entirely outside the current log,
+		// but the _tile_'s beginning was inside the log. For instance, a log with
+		// size 1000 and max_getentries of 256, where ctile is handling a request
+		// for start=1001&end=1002; the tile starts at offset 768, but is partial so
+		// it doesn't include the requested range.
+		//
+		// When Trillian gets a request that is past the end of the log, it returns
+		// 400 (for better or worse), so we emulate that here.
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte("requested range is past the end of the log"))
+		return
+	} else {
+		contents.Entries = contents.Entries[prefixToRemove:]
+	}
 
 	requestedLen := end - start
 	if len(contents.Entries) > int(requestedLen) {
