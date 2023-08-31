@@ -1,3 +1,4 @@
+// main is the entrypoint for the ctile binary.
 package main
 
 import (
@@ -20,7 +21,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-
 	"github.com/fxamacker/cbor/v2"
 )
 
@@ -36,11 +36,11 @@ func parseQueryParams(values url.Values) (int64, int64, error) {
 	}
 	startInt, err := strconv.ParseInt(start, 10, 64)
 	if err != nil || startInt < 0 {
-		return 0, 0, errors.New("invalid start parameter")
+		return 0, 0, fmt.Errorf("invalid start parameter: %w", err)
 	}
 	endInt, err := strconv.ParseInt(end, 10, 64)
 	if err != nil || endInt < 0 {
-		return 0, 0, errors.New("invalid end parameter")
+		return 0, 0, fmt.Errorf("invalid end parameter: %w", err)
 	}
 	if endInt <= startInt {
 		return 0, 0, errors.New("end must be greater than start")
@@ -48,34 +48,40 @@ func parseQueryParams(values url.Values) (int64, int64, error) {
 	return startInt, endInt, nil
 }
 
-// tile represents important numbers about a tile: where it starts, where it ends, its size,
-// and what CT backend URL it exists on (or is anticipated to exist on), and what s3 prefix
+// tile represents important info about a tile: where it starts, where it ends, its size,
+// what CT backend URL it exists on (or is anticipated to exist on), and what s3 prefix
 // it should be stored/retrieved under.
+//
+// `start` is inclusive, and `end` is exclusive, just like in the CT protocol.
+// In other words, they represent the half-open interval [start, end).
 type tile struct {
-	start    int64
-	end      int64
-	size     int64
-	logURL   string
-	s3prefix string
+	start  int64
+	end    int64
+	size   int64
+	logURL string
 }
 
 // makeTile returns a tile of size `size` that contains the given `start` position.
 // The resulting tile's `start` will be equal to or less than the requested `start`.
-func makeTile(start, size int64, backend string, s3prefix string) tile {
+func makeTile(start, size int64, logURL string) tile {
 	tileOffset := start % size
 	tileStart := start - tileOffset
 	return tile{
-		start:    tileStart,
-		end:      tileStart + size,
-		size:     size,
-		logURL:   backend,
-		s3prefix: s3prefix,
+		start:  tileStart,
+		end:    tileStart + size,
+		size:   size,
+		logURL: logURL,
 	}
 }
 
 // key returns the S3 key for the tile.
 func (t tile) key() string {
-	return fmt.Sprintf("%s/tile_size=%d/%d.cbor.gz", t.s3prefix, t.size, t.start)
+	return fmt.Sprintf("tile_size=%d/%d.cbor.gz", t.size, t.start)
+}
+
+// url returns the URL to fetch the tile from the backend.
+func (t tile) url() string {
+	return fmt.Sprintf("%s/ct/v1/get-entries?start=%d&end=%d", t.logURL, t.start, t.end)
 }
 
 // entries corresponds to the JSON response to the CT get-entries endpoint.
@@ -111,21 +117,21 @@ func (s statusCodeError) Error() string {
 // If the backend returns a non-200 status code, it returns a statusCodeError,
 // so the caller can handle that case specially by propagating the backend's
 // status code (for instance, 400 or 404).
-func getTileFromBackend(ctx context.Context, path string, t tile) (*entries, error) {
-	url := fmt.Sprintf("%s/%s?start=%d&end=%d", t.logURL, path, t.start, t.end)
+func getTileFromBackend(ctx context.Context, t tile) (*entries, error) {
+	url := t.url()
 	r, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("unable to create backend Request object: %s", err)
+		return nil, fmt.Errorf("unable to create backend Request object: %w", err)
 	}
 	resp, err := http.DefaultClient.Do(r)
 	if err != nil {
-		return nil, fmt.Errorf("fetching %s: %s", url, err)
+		return nil, fmt.Errorf("fetching %s: %w", url, err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			return nil, fmt.Errorf("reading body from %s: %s", url, err)
+			return nil, fmt.Errorf("reading body from %s: %w", url, err)
 		}
 		return nil, statusCodeError{resp.StatusCode, body}
 	}
@@ -133,7 +139,7 @@ func getTileFromBackend(ctx context.Context, path string, t tile) (*entries, err
 	var entries entries
 	err = json.NewDecoder(resp.Body).Decode(&entries)
 	if err != nil {
-		return nil, fmt.Errorf("reading body from %s: %s", url, err)
+		return nil, fmt.Errorf("reading body from %s: %w", url, err)
 	}
 
 	if len(entries.Entries) > int(t.size) || len(entries.Entries) == 0 {
@@ -144,7 +150,7 @@ func getTileFromBackend(ctx context.Context, path string, t tile) (*entries, err
 }
 
 // writeToS3 stores the entries corresponding to the given tile in s3.
-func writeToS3(ctx context.Context, svc *s3.Client, bucket string, t tile, e *entries) error {
+func (tch *tileCachingHandler) writeToS3(ctx context.Context, t tile, e *entries) error {
 	if len(e.Entries) != int(t.size) || t.end != t.start+t.size {
 		return fmt.Errorf("internal inconsistency: len(entries) == %d; tile = %v", len(e.Entries), t)
 	}
@@ -158,17 +164,17 @@ func writeToS3(ctx context.Context, svc *s3.Client, bucket string, t tile, e *en
 
 	err = w.Close()
 	if err != nil {
-		return fmt.Errorf("closing gzip writer: %s", err)
+		return fmt.Errorf("closing gzip writer: %w", err)
 	}
 
-	key := t.key()
-	_, err = svc.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(bucket),
+	key := tch.s3Prefix + t.key()
+	_, err = tch.s3Service.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(tch.s3Bucket),
 		Key:    aws.String(key),
 		Body:   bytes.NewReader(body.Bytes()),
 	})
 	if err != nil {
-		return fmt.Errorf("putting in bucket %q with key %q: %s", bucket, key, err)
+		return fmt.Errorf("putting in bucket %q with key %q: %s", tch.s3Bucket, key, err)
 	}
 	return nil
 }
@@ -182,10 +188,10 @@ func (noSuchKey) Error() string {
 
 // getFromS3 retrieves the entries corresponding to the given tile from s3.
 // If the tile isn't already stored in s3, it returns a noSuchKey error.
-func getFromS3(ctx context.Context, svc *s3.Client, bucket string, t tile) (*entries, error) {
-	key := t.key()
-	resp, err := svc.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(bucket),
+func (tch *tileCachingHandler) getFromS3(ctx context.Context, t tile) (*entries, error) {
+	key := tch.s3Prefix + t.key()
+	resp, err := tch.s3Service.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(tch.s3Bucket),
 		Key:    aws.String(key),
 	})
 	if err != nil {
@@ -193,7 +199,7 @@ func getFromS3(ctx context.Context, svc *s3.Client, bucket string, t tile) (*ent
 		if errors.As(err, &nsk) {
 			return nil, noSuchKey{}
 		}
-		return nil, fmt.Errorf("getting from bucket %q with key %q: %w", bucket, key, err)
+		return nil, fmt.Errorf("getting from bucket %q with key %q: %w", tch.s3Bucket, key, err)
 	}
 
 	var entries entries
@@ -203,7 +209,7 @@ func getFromS3(ctx context.Context, svc *s3.Client, bucket string, t tile) (*ent
 	}
 	err = cbor.NewDecoder(gzipReader).Decode(&entries)
 	if err != nil {
-		return nil, fmt.Errorf("reading body from bucket %q with key %q: %w", bucket, key, err)
+		return nil, fmt.Errorf("reading body from bucket %q with key %q: %w", tch.s3Bucket, key, err)
 	}
 
 	if len(entries.Entries) != int(t.size) || t.end != t.start+t.size {
@@ -238,11 +244,15 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	tile := makeTile(start, int64(tch.tileSize), tch.logURL, tch.s3Prefix)
+	tile := makeTile(start, int64(tch.tileSize), tch.logURL)
 
-	contents, err := getFromS3(r.Context(), tch.s3Service, tch.s3Bucket, tile)
-	if err != nil && errors.Is(err, noSuchKey{}) {
-		contents, err = getTileFromBackend(r.Context(), r.URL.Path, tile)
+	contents, err := tch.getFromS3(r.Context(), tile)
+	if err != nil && !errors.Is(err, noSuchKey{}) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "reading from s3: %s\n", err)
+		return
+	} else if errors.Is(err, noSuchKey{}) {
+		contents, err = getTileFromBackend(r.Context(), tile)
 		if err != nil {
 			status := http.StatusInternalServerError
 			var statusCodeErr statusCodeError
@@ -258,7 +268,7 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		// tile isn't filled up yet. In that case, don't write to S3, but still return
 		// results to the user.
 		if len(contents.Entries) == tch.tileSize {
-			err := writeToS3(r.Context(), tch.s3Service, tch.s3Bucket, tile, contents)
+			err := tch.writeToS3(r.Context(), tile, contents)
 			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				fmt.Fprintf(w, "writing to s3: %s\n", err)
@@ -269,10 +279,6 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		}
 
 		w.Header().Set("X-Source", "CT log")
-	} else if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "reading from s3: %s\n", err)
-		return
 	} else {
 		w.Header().Set("X-Source", "S3")
 	}
