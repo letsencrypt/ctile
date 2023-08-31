@@ -172,7 +172,7 @@ func TestIntegration(t *testing.T) {
 	}
 
 	// Valid query; should 200
-	twoEntriesA, headers, err := getAndParseResp(ctile, "/ct/v1/get-entries?start=3&end=5")
+	twoEntriesA, headers, err := getAndParseResp(t, ctile, "/ct/v1/get-entries?start=3&end=5")
 	if err != nil {
 		t.Error(err)
 	}
@@ -184,7 +184,7 @@ func TestIntegration(t *testing.T) {
 	}
 
 	// Same query again; should come from S3 this time.
-	twoEntriesB, headers, err := getAndParseResp(ctile, "/ct/v1/get-entries?start=3&end=5")
+	twoEntriesB, headers, err := getAndParseResp(t, ctile, "/ct/v1/get-entries?start=3&end=5")
 	if err != nil {
 		t.Error(err)
 	}
@@ -202,7 +202,7 @@ func TestIntegration(t *testing.T) {
 
 	// The third entry in this first tile should also be served from S3 now, because it
 	// was pulled into cache by the previous requests.
-	oneEntry, headers, err := getAndParseResp(ctile, "/ct/v1/get-entries?start=5&end=6")
+	oneEntry, headers, err := getAndParseResp(t, ctile, "/ct/v1/get-entries?start=5&end=6")
 	if err != nil {
 		t.Error(err)
 	}
@@ -214,14 +214,14 @@ func TestIntegration(t *testing.T) {
 	}
 
 	// Tiles fetched from the end of the log will be partial. Ctile should not cache.
-	_, headers, err = getAndParseResp(ctile, "/ct/v1/get-entries?start=9&end=11")
+	_, headers, err = getAndParseResp(t, ctile, "/ct/v1/get-entries?start=9&end=11")
 	if err != nil {
 		t.Error(err)
 	}
 
 	expectHeader(t, headers, "X-Source", "CT log")
 
-	_, headers, err = getAndParseResp(ctile, "/ct/v1/get-entries?start=9&end=11")
+	_, headers, err = getAndParseResp(t, ctile, "/ct/v1/get-entries?start=9&end=11")
 	if err != nil {
 		t.Error(err)
 	}
@@ -263,11 +263,11 @@ func getResp(ctile tileCachingHandler, url string) *http.Response {
 	return w.Result()
 }
 
-func getAndParseResp(ctile tileCachingHandler, url string) (entries, http.Header, error) {
+func getAndParseResp(t *testing.T, ctile tileCachingHandler, url string) (entries, http.Header, error) {
 	resp := getResp(ctile, url)
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		panic(fmt.Sprintf("%q: expected status code 200 got %d with body: %q", url, resp.StatusCode, body))
+		t.Fatalf("%q: expected status code 200 got %d with body: %q", url, resp.StatusCode, body)
 	}
 	var entries entries
 	err := json.Unmarshal(body, &entries)
