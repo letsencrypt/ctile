@@ -330,9 +330,8 @@ func (tch *tileCachingHandler) getAndCacheTile(ctx context.Context, tile tile) (
 		return entriesAndSource{contents, source}, err
 	})
 
-	// In order to preserve the source variable from getAndCacheTileUncollapsed,
-	// the func passed to singleflightDo always returns a useful
-	// entriesAndSource, and so we don't need an err != nil check here.
+	// The value from our singleflightDo closure is always non-nil, so we don't
+	// need an err != nil check here.
 	return innerContents.entries, innerContents.source, err
 }
 
