@@ -22,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fxamacker/cbor/v2"
+	"golang.org/x/sync/singleflight"
 )
 
 // parseQueryParams returns the start and end values, or an error.
@@ -229,11 +230,13 @@ func (tch *tileCachingHandler) getFromS3(ctx context.Context, t tile) (*entries,
 // from a backend server and from the cache tiles it maintains in S3.
 type tileCachingHandler struct {
 	logURL   string // The string form of the HTTP host and path prefix to add incoming request paths to in order to fetch tiles from the backing CT log. Must not be empty.
-	tileSize int    // The CT tile size used here and in the given backend. Must not be zero.
+	tileSize int    // The CT tile size used here and in the backing CT log. Must be the same as the backing CT log's value and must not be zero.
 
 	s3Service *s3.Client // The S3 service to use for caching tiles. Must not be nil.
 	s3Prefix  string     // The prefix to add to the path when caching tiles in S3. Must not be empty.
 	s3Bucket  string     // The S3 bucket to use for caching tiles. Must not be empty.
+
+	cacheGroup *singleflight.Group // The singleflight.Group to use for deduplicating simultaneous requests (a.k.a. "request collapsing") for tiles. Must not be nil.
 }
 
 func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -310,7 +313,31 @@ const (
 	sourceS3    tileSource = "S3"
 )
 
+// getAndCacheTile fetches the requested tile from S3 if it exists there, or, if
+// it doesn't exist in S3, from the backing CT log and then caches it in S3.
+// Under the hood, it collapses requests for the same tile into one single
+// request. It should be preferred over getAndCacheTileUncollapsed.
 func (tch *tileCachingHandler) getAndCacheTile(ctx context.Context, tile tile) (*entries, tileSource, error) {
+	dedupKey := fmt.Sprintf("logURL-%s-tile-%d-%d", tile.logURL, tile.start, tile.end)
+
+	type entriesAndSource struct {
+		entries *entries
+		source  tileSource
+	}
+
+	innerContents, err, _ := singleflightDo(tch.cacheGroup, dedupKey, func() (entriesAndSource, error) {
+		contents, source, err := tch.getAndCacheTileUncollapsed(ctx, tile)
+		return entriesAndSource{contents, source}, err
+	})
+
+	// The value from our singleflightDo closure is always non-nil, so we don't
+	// need an err != nil check here.
+	return innerContents.entries, innerContents.source, err
+}
+
+// getAndCacheTileUncollapsed is the core of getAndCacheTile (and is used by it)
+// without the request collapsing. Use getAndCacheTile instead of this method.
+func (tch *tileCachingHandler) getAndCacheTileUncollapsed(ctx context.Context, tile tile) (*entries, tileSource, error) {
 	contents, err := tch.getFromS3(ctx, tile)
 	if err == nil {
 		return contents, sourceS3, nil
@@ -343,6 +370,16 @@ func (tch *tileCachingHandler) getAndCacheTile(ctx context.Context, tile tile) (
 // requested by the tileCachingHandler.
 func (tch *tileCachingHandler) isPartialTile(contents *entries) bool {
 	return len(contents.Entries) < tch.tileSize
+}
+
+// singleflightDo is a wrapper around singleflight.Group.Do that, instead of
+// returning an interface{}, returns the exact type of the first return type of
+// the function fn. (singleflight was built before generics)
+func singleflightDo[V any](group *singleflight.Group, key string, fn func() (V, error)) (V, error, bool) {
+	out, err, shared := group.Do(key, func() (interface{}, error) {
+		return fn()
+	})
+	return out.(V), err, shared
 }
 
 func main() {
@@ -384,11 +421,12 @@ func main() {
 	svc := s3.NewFromConfig(cfg)
 
 	handler := &tileCachingHandler{
-		logURL:    *logURL,
-		tileSize:  *tileSize,
-		s3Service: svc,
-		s3Prefix:  *s3prefix,
-		s3Bucket:  *s3bucket,
+		logURL:     *logURL,
+		tileSize:   *tileSize,
+		s3Service:  svc,
+		s3Prefix:   *s3prefix,
+		s3Bucket:   *s3bucket,
+		cacheGroup: &singleflight.Group{},
 	}
 
 	srv := http.Server{

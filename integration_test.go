@@ -23,6 +23,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"golang.org/x/sync/singleflight"
 )
 
 func TestMain(m *testing.M) {
@@ -146,6 +147,8 @@ func TestIntegration(t *testing.T) {
 		s3Service: s3Service,
 		s3Prefix:  "test",
 		s3Bucket:  "bucket",
+
+		cacheGroup: &singleflight.Group{},
 	}
 
 	// Invalid URL; should 404
