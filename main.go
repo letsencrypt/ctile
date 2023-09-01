@@ -252,42 +252,23 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 	tile := makeTile(start, int64(tch.tileSize), tch.logURL)
 
-	contents, err := tch.getFromS3(r.Context(), tile)
-	if err != nil && !errors.Is(err, noSuchKey{}) {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "reading from s3: %s\n", err)
+	contents, source, err := tch.getAndCacheTile(r.Context(), tile)
+	if err != nil {
+		status := http.StatusInternalServerError
+		var statusCodeErr statusCodeError
+		if errors.As(err, &statusCodeErr) {
+			status = statusCodeErr.statusCode
+		}
+		w.WriteHeader(status)
+		fmt.Fprintln(w, err)
 		return
-	} else if errors.Is(err, noSuchKey{}) {
-		contents, err = getTileFromBackend(r.Context(), tile)
-		if err != nil {
-			status := http.StatusInternalServerError
-			var statusCodeErr statusCodeError
-			if errors.As(err, &statusCodeErr) {
-				status = statusCodeErr.statusCode
-			}
-			w.WriteHeader(status)
-			fmt.Fprintln(w, err)
-			return
-		}
-
-		// If we got a partial tile, assume we are at the end of the log and the last
-		// tile isn't filled up yet. In that case, don't write to S3, but still return
-		// results to the user.
-		if len(contents.Entries) == tch.tileSize {
-			err := tch.writeToS3(r.Context(), tile, contents)
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				fmt.Fprintf(w, "writing to s3: %s\n", err)
-				return
-			}
-		} else {
-			w.Header().Set("X-Partial-Tile", "true")
-		}
-
-		w.Header().Set("X-Source", "CT log")
-	} else {
-		w.Header().Set("X-Source", "S3")
 	}
+
+	if tch.isPartialTile(contents) {
+		w.Header().Set("X-Partial-Tile", "true")
+	}
+
+	w.Header().Set("X-Source", string(source))
 
 	// Truncate to match the request
 	prefixToRemove := start - tile.start
@@ -318,6 +299,50 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
 	encoder.Encode(contents)
+}
+
+// tileSource is a helper enum to indicate to the user whether the tile returned
+// to them was found in S3 or in the CT log.
+type tileSource string
+
+const (
+	sourceCTLog tileSource = "CT log"
+	sourceS3    tileSource = "S3"
+)
+
+func (tch *tileCachingHandler) getAndCacheTile(ctx context.Context, tile tile) (*entries, tileSource, error) {
+	contents, err := tch.getFromS3(ctx, tile)
+	if err == nil {
+		return contents, sourceS3, nil
+	}
+
+	if !errors.Is(err, noSuchKey{}) {
+		return nil, sourceS3, fmt.Errorf("error reading tile from s3: %w", err)
+	}
+
+	contents, err = getTileFromBackend(ctx, tile)
+	if err != nil {
+		return nil, sourceCTLog, fmt.Errorf("error reading tile from backend: %w", err)
+	}
+
+	// If we got a partial tile, assume we are at the end of the log and the last
+	// tile isn't filled up yet. In that case, don't write to S3, but still return
+	// results to the user.
+	if tch.isPartialTile(contents) {
+		return contents, sourceCTLog, nil
+	}
+
+	err = tch.writeToS3(ctx, tile, contents)
+	if err != nil {
+		return nil, sourceCTLog, fmt.Errorf("error writing tile to S3: %w", err)
+	}
+	return contents, sourceCTLog, nil
+}
+
+// isPartialTile returns true if there are fewer items in the tile than were
+// requested by the tileCachingHandler.
+func (tch *tileCachingHandler) isPartialTile(contents *entries) bool {
+	return len(contents.Entries) < tch.tileSize
 }
 
 func main() {
