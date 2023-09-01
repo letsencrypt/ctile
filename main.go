@@ -236,7 +236,7 @@ type tileCachingHandler struct {
 	s3Prefix  string     // The prefix to add to the path when caching tiles in S3. Must not be empty.
 	s3Bucket  string     // The S3 bucket to use for caching tiles. Must not be empty.
 
-	cacheGroup *singleflight.Group // The singleflight.Group to use for dedupulicating simultaneous requests (a.k.a. "request collapsing") for tiles. Must not be nil.
+	cacheGroup *singleflight.Group // The singleflight.Group to use for deduplicating simultaneous requests (a.k.a. "request collapsing") for tiles. Must not be nil.
 }
 
 func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
