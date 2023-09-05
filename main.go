@@ -411,7 +411,7 @@ func main() {
 	s3bucket := flag.String("s3-bucket", "", "s3 bucket to use for caching")
 	s3prefix := flag.String("s3-prefix", "", "prefix for s3 keys. defaults to value of -backend")
 	listenAddress := flag.String("listen-address", ":7962", "address to listen on")
-	metricsAddress := flag.String("metrics-address", ":7963", "address to listen on")
+	metricsAddress := flag.String("metrics-address", ":7963", "address to listen on for metrics")
 
 	// fullRequestTimeout is the max allowed time the handler can read from S3 and return or read from S3, read from backend, write to S3, and return.
 	fullRequestTimeout := flag.Duration("full-request-timeout", 4*time.Second, "max time to spend in the HTTP handler")
@@ -465,7 +465,7 @@ func main() {
 	singleFlightShared := prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: "ctile_single_flight_shared",
-			Help: "how many inbound requests were coalesced into a single set of backend requests",
+			Help: "number of inbound requests coalesced into a single set of backend requests",
 		})
 	promRegistry.MustRegister(singleFlightShared)
 
