@@ -448,7 +448,7 @@ func main() {
 
 	requestsMetric := prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "requests",
+			Name: "ctile_requests",
 			Help: "total number of requests, by result and source",
 		},
 		[]string{"result", "source"},
@@ -457,14 +457,14 @@ func main() {
 
 	partialTiles := prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Name: "partial_tiles",
+			Name: "ctile_partial_tiles",
 			Help: "number of requests not cached due to partial tile returned from CT log",
 		})
 	promRegistry.MustRegister(partialTiles)
 
 	singleFlightShared := prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Name: "single_flight_shared",
+			Name: "ctile_single_flight_shared",
 			Help: "how many inbound requests were coalesced into a single set of backend requests",
 		})
 	promRegistry.MustRegister(singleFlightShared)
