@@ -432,7 +432,7 @@ func main() {
 	srv := http.Server{
 		Addr:              *listenAddress,
 		ReadTimeout:       5 * time.Second,
-		WriteTimeout:      *fullRequestTimeout + 1*time.Second, // must be a bit larger than than than the max time spent in the HTTP handler
+		WriteTimeout:      *fullRequestTimeout + 1*time.Second, // must be a bit larger than the max time spent in the HTTP handler
 		IdleTimeout:       5 * time.Minute,
 		ReadHeaderTimeout: 2 * time.Second,
 		Handler:           http.TimeoutHandler(handler, *fullRequestTimeout, "full request timeout"),
