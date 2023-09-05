@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fxamacker/cbor/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -237,6 +241,10 @@ type tileCachingHandler struct {
 	s3Bucket  string     // The S3 bucket to use for caching tiles. Must not be empty.
 
 	cacheGroup *singleflight.Group // The singleflight.Group to use for deduplicating simultaneous requests (a.k.a. "request collapsing") for tiles. Must not be nil.
+
+	requestsMetric     *prometheus.CounterVec
+	partialTiles       prometheus.Counter
+	singleFlightShared prometheus.Counter
 }
 
 func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -284,8 +292,9 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		//
 		// When Trillian gets a request that is past the end of the log, it returns
 		// 400 (for better or worse), so we emulate that here.
+		tch.requestsMetric.WithLabelValues("error", "ct_log_past_end").Inc()
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("requested range is past the end of the log"))
+		fmt.Fprintln(w, "requested range is past the end of the log")
 		return
 	} else {
 		contents.Entries = contents.Entries[prefixToRemove:]
@@ -294,6 +303,12 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	requestedLen := end - start
 	if len(contents.Entries) > int(requestedLen) {
 		contents.Entries = contents.Entries[:requestedLen]
+	}
+
+	if w.Header().Get("X-Source") == "S3" {
+		tch.requestsMetric.WithLabelValues("success", "s3").Inc()
+	} else {
+		tch.requestsMetric.WithLabelValues("success", "ct_log").Inc()
 	}
 
 	w.Header().Set("X-Response-Len", fmt.Sprintf("%d", len(contents.Entries)))
@@ -325,10 +340,14 @@ func (tch *tileCachingHandler) getAndCacheTile(ctx context.Context, tile tile) (
 		source  tileSource
 	}
 
-	innerContents, err, _ := singleflightDo(tch.cacheGroup, dedupKey, func() (entriesAndSource, error) {
+	innerContents, err, shared := singleflightDo(tch.cacheGroup, dedupKey, func() (entriesAndSource, error) {
 		contents, source, err := tch.getAndCacheTileUncollapsed(ctx, tile)
 		return entriesAndSource{contents, source}, err
 	})
+
+	if shared {
+		tch.singleFlightShared.Inc()
+	}
 
 	// The value from our singleflightDo closure is always non-nil, so we don't
 	// need an err != nil check here.
@@ -344,11 +363,13 @@ func (tch *tileCachingHandler) getAndCacheTileUncollapsed(ctx context.Context, t
 	}
 
 	if !errors.Is(err, noSuchKey{}) {
+		tch.requestsMetric.WithLabelValues("error", "s3_get").Inc()
 		return nil, sourceS3, fmt.Errorf("error reading tile from s3: %w", err)
 	}
 
 	contents, err = getTileFromBackend(ctx, tile)
 	if err != nil {
+		tch.requestsMetric.WithLabelValues("error", "ct_log_get").Inc()
 		return nil, sourceCTLog, fmt.Errorf("error reading tile from backend: %w", err)
 	}
 
@@ -356,11 +377,13 @@ func (tch *tileCachingHandler) getAndCacheTileUncollapsed(ctx context.Context, t
 	// tile isn't filled up yet. In that case, don't write to S3, but still return
 	// results to the user.
 	if tch.isPartialTile(contents) {
+		tch.partialTiles.Inc()
 		return contents, sourceCTLog, nil
 	}
 
 	err = tch.writeToS3(ctx, tile, contents)
 	if err != nil {
+		tch.requestsMetric.WithLabelValues("error", "s3_put").Inc()
 		return nil, sourceCTLog, fmt.Errorf("error writing tile to S3: %w", err)
 	}
 	return contents, sourceCTLog, nil
@@ -387,7 +410,8 @@ func main() {
 	tileSize := flag.Int("tile-size", 0, "tile size. Must match the value used by the backend")
 	s3bucket := flag.String("s3-bucket", "", "s3 bucket to use for caching")
 	s3prefix := flag.String("s3-prefix", "", "prefix for s3 keys. defaults to value of -backend")
-	listenAddress := flag.String("listen-address", ":8080", "address to listen on")
+	listenAddress := flag.String("listen-address", ":7962", "address to listen on")
+	metricsAddress := flag.String("metrics-address", ":7963", "address to listen on")
 
 	// fullRequestTimeout is the max allowed time the handler can read from S3 and return or read from S3, read from backend, write to S3, and return.
 	fullRequestTimeout := flag.Duration("full-request-timeout", 4*time.Second, "max time to spend in the HTTP handler")
@@ -420,13 +444,41 @@ func main() {
 	}
 	svc := s3.NewFromConfig(cfg)
 
+	promRegistry := newStatsRegistry(*metricsAddress)
+
+	requestsMetric := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "requests",
+			Help: "total number of requests, by result and source",
+		},
+		[]string{"result", "source"},
+	)
+	promRegistry.MustRegister(requestsMetric)
+
+	partialTiles := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "partial_tiles",
+			Help: "number of requests not cached due to partial tile returned from CT log",
+		})
+	promRegistry.MustRegister(partialTiles)
+
+	singleFlightShared := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "single_flight_shared",
+			Help: "how many inbound requests were coalesced into a single set of backend requests",
+		})
+	promRegistry.MustRegister(singleFlightShared)
+
 	handler := &tileCachingHandler{
-		logURL:     *logURL,
-		tileSize:   *tileSize,
-		s3Service:  svc,
-		s3Prefix:   *s3prefix,
-		s3Bucket:   *s3bucket,
-		cacheGroup: &singleflight.Group{},
+		logURL:             *logURL,
+		tileSize:           *tileSize,
+		s3Service:          svc,
+		s3Prefix:           *s3prefix,
+		s3Bucket:           *s3bucket,
+		cacheGroup:         &singleflight.Group{},
+		requestsMetric:     requestsMetric,
+		partialTiles:       partialTiles,
+		singleFlightShared: singleFlightShared,
 	}
 
 	srv := http.Server{
@@ -439,4 +491,28 @@ func main() {
 	}
 
 	log.Fatal(srv.ListenAndServe())
+}
+
+func newStatsRegistry(listenAddress string) prometheus.Registerer {
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collectors.NewGoCollector())
+	registry.MustRegister(collectors.NewProcessCollector(
+		collectors.ProcessCollectorOpts{}))
+
+	server := http.Server{
+		Addr:              listenAddress,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      5 * time.Second,
+		IdleTimeout:       5 * time.Minute,
+		ReadHeaderTimeout: 2 * time.Second,
+		Handler:           promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
+	}
+	go func() {
+		err := server.ListenAndServe()
+		if err != nil {
+			log.Printf("unable to start metrics server on %s: %s\n", listenAddress, err)
+			os.Exit(1)
+		}
+	}()
+	return registry
 }
