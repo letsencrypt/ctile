@@ -1,4 +1,4 @@
-module github.com/jsha/ctile
+module github.com/letsencrypt/ctile
 
 go 1.20
 
