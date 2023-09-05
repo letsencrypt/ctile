@@ -306,9 +306,9 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 
 	if w.Header().Get("X-Source") == "S3" {
-		tch.requestsMetric.WithLabelValues("success", "s3").Inc()
+		tch.requestsMetric.WithLabelValues("success", "s3_get").Inc()
 	} else {
-		tch.requestsMetric.WithLabelValues("success", "ct_log").Inc()
+		tch.requestsMetric.WithLabelValues("success", "ct_log_get").Inc()
 	}
 
 	w.Header().Set("X-Response-Len", fmt.Sprintf("%d", len(contents.Entries)))
