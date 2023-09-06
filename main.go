@@ -112,12 +112,12 @@ func (p pastTheEndError) Error() string {
 	return "requested range is past the end of the log"
 }
 
-// TrimForDisplay takes a set of entries corresponding to `tile`, and returns a new
+// trimForDisplay takes a set of entries corresponding to `tile`, and returns a new
 // object suitable for a request for entries in the range [start, end).
 //
 // This does not mutate the original object. It is suitable for calling when the set
 // of entries represents a partial tile.
-func (e *entries) TrimForDisplay(start, end int64, tile tile) (*entries, error) {
+func (e *entries) trimForDisplay(start, end int64, tile tile) (*entries, error) {
 	if start < tile.start || start >= tile.end || end <= start || len(e.Entries) > int(tile.size) {
 		return nil, fmt.Errorf("internal inconsistency: start = %d, end = %d, tile = %v, len(e.Entries) = %d", start, end, tile, len(e.Entries))
 	}
@@ -326,7 +326,7 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 	w.Header().Set("X-Source", string(source))
 
-	contents, err = contents.TrimForDisplay(start, end, tile)
+	contents, err = contents.trimForDisplay(start, end, tile)
 	if err != nil {
 		if errors.As(err, &pastTheEndError{}) {
 			tch.requestsMetric.WithLabelValues("error", "ct_log_past_end").Inc()
