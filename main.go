@@ -469,8 +469,9 @@ func main() {
 		*s3prefix = *logURL
 	}
 
-	if strings.HasPrefix(*s3bucket, "s3://") {
-		*s3bucket = strings.TrimPrefix(*s3bucket, "s3://")
+	_, err := url.ParseRequestURI(*s3bucket)
+	if err == nil {
+		log.Fatal("scheme provided for s3-bucket, but should not be")
 	}
 
 	cfg, err := config.LoadDefaultConfig(context.Background())
