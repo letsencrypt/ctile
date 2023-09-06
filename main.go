@@ -322,7 +322,9 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	contents, err = contents.trimForDisplay(start, end, tile)
 	if err != nil {
 		if errors.As(err, &pastTheEndError{}) {
-			tch.requestsMetric.WithLabelValues("error", "ct_log_past_end").Inc()
+			tch.requestsMetric.WithLabelValues("bad_request", "past_the_end_partial_tile").Inc()
+		} else {
+			tch.requestsMetric.WithLabelValues("error", "internal_inconsistency").Inc()
 		}
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprintln(w, err)
@@ -393,7 +395,14 @@ func (tch *tileCachingHandler) getAndCacheTileUncollapsed(ctx context.Context, t
 
 	contents, err = getTileFromBackend(ctx, tile)
 	if err != nil {
-		tch.requestsMetric.WithLabelValues("error", "ct_log_get").Inc()
+		var statusCodeErr statusCodeError
+		// Requests for tiles past the end of the log will get a 400 from CTFE, so report those
+		// separately.
+		if errors.As(err, &statusCodeErr) && statusCodeErr.statusCode == http.StatusBadRequest {
+			tch.requestsMetric.WithLabelValues("bad_request", "ct_log_get").Inc()
+		} else {
+			tch.requestsMetric.WithLabelValues("error", "ct_log_get").Inc()
+		}
 		return nil, sourceCTLog, fmt.Errorf("error reading tile from backend: %w", err)
 	}
 

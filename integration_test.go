@@ -22,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -139,20 +140,7 @@ func TestIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctile := tileCachingHandler{
-		logURL:   server.URL,
-		tileSize: 3,
-
-		s3Service: s3Service,
-		s3Prefix:  "test",
-		s3Bucket:  "bucket",
-
-		cacheGroup: &singleflight.Group{},
-
-		requestsMetric:     prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"result", "source"}),
-		partialTiles:       prometheus.NewCounter(prometheus.CounterOpts{}),
-		singleFlightShared: prometheus.NewCounter(prometheus.CounterOpts{}),
-	}
+	ctile := makeTCH(server.URL, s3Service)
 
 	// Invalid URL; should be passed through to backend and 400
 	resp := getResp(ctile, "/foo")
@@ -190,6 +178,12 @@ func TestIntegration(t *testing.T) {
 		t.Errorf("expected 2 entries got %d", len(twoEntriesA.Entries))
 	}
 
+	successes := testutil.ToFloat64(ctile.requestsMetric.WithLabelValues("success", "ct_log_get"))
+	if successes != 1 {
+		t.Errorf("expected 1 success from ct_log_get, got %g", successes)
+	}
+	ctile.requestsMetric.Reset()
+
 	// Same query again; should come from S3 this time.
 	twoEntriesB, headers, err := getAndParseResp(t, ctile, "/ct/v1/get-entries?start=3&end=4")
 	if err != nil {
@@ -197,6 +191,7 @@ func TestIntegration(t *testing.T) {
 	}
 
 	expectHeader(t, headers, "X-Source", "S3")
+	expectAndResetMetric(t, ctile.requestsMetric, 1, "success", "s3_get")
 
 	if len(twoEntriesB.Entries) != 2 {
 		t.Errorf("expected 2 entries got %d", len(twoEntriesB.Entries))
@@ -215,6 +210,7 @@ func TestIntegration(t *testing.T) {
 	}
 
 	expectHeader(t, headers, "X-Source", "S3")
+	expectAndResetMetric(t, ctile.requestsMetric, 1, "success", "s3_get")
 
 	if len(oneEntry.Entries) != 1 {
 		t.Errorf("expected 1 entry got %d", len(oneEntry.Entries))
@@ -227,6 +223,7 @@ func TestIntegration(t *testing.T) {
 	}
 
 	expectHeader(t, headers, "X-Source", "CT log")
+	expectAndResetMetric(t, ctile.requestsMetric, 1, "success", "ct_log_get")
 
 	_, headers, err = getAndParseResp(t, ctile, "/ct/v1/get-entries?start=9&end=11")
 	if err != nil {
@@ -236,6 +233,7 @@ func TestIntegration(t *testing.T) {
 	// This should still come from the CT log rather than from S3, even though it was
 	// requested twice in a row.
 	expectHeader(t, headers, "X-Source", "CT log")
+	expectAndResetMetric(t, ctile.requestsMetric, 1, "success", "ct_log_get")
 
 	// Tiles fetched past the end of the log will get a 400 from our test CT log; ctile
 	// should pass that through, along with the body.
@@ -247,6 +245,7 @@ func TestIntegration(t *testing.T) {
 	if !strings.Contains(string(body), testLogSaysPastTheEnd) {
 		t.Errorf("expected response to contain %q got %q", testLogSaysPastTheEnd, body)
 	}
+	expectAndResetMetric(t, ctile.requestsMetric, 1, "bad_request", "ct_log_get")
 
 	// A request where the _tile_ starts inside the log but the requested `start` value is
 	// outside the log. In this case ctile synthesizes a 400.
@@ -259,6 +258,20 @@ func TestIntegration(t *testing.T) {
 	if !strings.Contains(string(body), pastTheEnd) {
 		t.Errorf("expected response to contain %q got %q", pastTheEnd, body)
 	}
+	expectAndResetMetric(t, ctile.requestsMetric, 1, "bad_request", "past_the_end_partial_tile")
+
+	// simulate a down backend
+	errorCTLog := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	erroringCTile := makeTCH(errorCTLog.URL, s3Service)
+	resp = getResp(erroringCTile, "/ct/v1/get-entries?start=0&end=1")
+	if resp.StatusCode != 500 {
+		t.Errorf("expected 500 got %d", resp.StatusCode)
+	}
+	expectAndResetMetric(t, erroringCTile.requestsMetric, 1, "error", "ct_log_get")
 }
 
 func getResp(ctile tileCachingHandler, url string) *http.Response {
@@ -286,5 +299,30 @@ func expectHeader(t *testing.T, headers http.Header, key, expected string) {
 	t.Helper()
 	if headers.Get(key) != expected {
 		t.Errorf("header %q: expected %q got %q", key, expected, headers.Get(key))
+	}
+}
+
+func expectAndResetMetric(t *testing.T, metric *prometheus.CounterVec, expected float64, labels ...string) {
+	value := testutil.ToFloat64(metric.WithLabelValues(labels...))
+	if value != expected {
+		t.Errorf("expected Prometheus counter value of %g got %g with labels %s", expected, value, labels)
+	}
+	metric.Reset()
+}
+
+func makeTCH(url string, s3Service *s3.Client) tileCachingHandler {
+	return tileCachingHandler{
+		logURL:   url,
+		tileSize: 3,
+
+		s3Service: s3Service,
+		s3Prefix:  "test",
+		s3Bucket:  "bucket",
+
+		cacheGroup: &singleflight.Group{},
+
+		requestsMetric:     prometheus.NewCounterVec(prometheus.CounterOpts{Help: "foo", Name: "ctile_requests"}, []string{"result", "source"}),
+		partialTiles:       prometheus.NewCounter(prometheus.CounterOpts{Name: "ctile_partial_tiles"}),
+		singleFlightShared: prometheus.NewCounter(prometheus.CounterOpts{Name: "ctile_singleflight_shared"}),
 	}
 }
