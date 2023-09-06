@@ -112,6 +112,10 @@ type entries struct {
 // This does not mutate the original object. It is suitable for calling when the set
 // of entries represents a partial tile.
 func (e *entries) TrimForDisplay(start, end int64, tile tile) (*entries, error) {
+	if start < tile.start || start >= tile.end || end <= start || len(e.Entries) > int(tile.size) {
+		return nil, fmt.Errorf("internal inconsistency: start = %d, end = %d, tile = %v, len(e.Entries) = %d", start, end, tile, len(e.Entries))
+	}
+
 	// Truncate to match the request
 	prefixToRemove := start - tile.start
 	if prefixToRemove >= int64(len(e.Entries)) {
@@ -124,10 +128,6 @@ func (e *entries) TrimForDisplay(start, end int64, tile tile) (*entries, error) 
 		// When Trillian gets a request that is past the end of the log, it returns
 		// 400 (for better or worse), so we emulate that here.
 		return nil, errors.New("requested range is past the end of the log")
-	}
-
-	if prefixToRemove < 0 {
-		return nil, fmt.Errorf("internal inconsistency: prefixToRemove = %d; tile = %v", prefixToRemove, tile)
 	}
 
 	requestedLen := end - start
