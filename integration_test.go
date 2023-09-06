@@ -27,8 +27,38 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+const containerName string = "ctile_integration_test_minio"
+
+// cleanupContainer stops a running named container and removes its assigned
+// name.
+func cleanupContainer() {
+	// We throw away the error here because ps will return code 125 if the
+	// name doesn't exist, but that's the whole point of this check.
+	isContainerRunning, _ := exec.Command("podman", "ps", "--filter", fmt.Sprintf("name=%s", containerName), "--format={{ .ID }}").Output()
+	if len(isContainerRunning) > 0 {
+		_, err := exec.Command("podman", "stop", containerName).Output()
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	// We throw away the error here because ps will return code 125 if the
+	// name doesn't exist, but that's the whole point of this check.
+	danglingName, _ := exec.Command("podman", "ps", "--all", "--filter", fmt.Sprintf("name=%s", containerName), "--format={{ .ID }}").Output()
+	if len(danglingName) > 0 {
+		_, err := exec.Command("podman", "rm", "--force", containerName).Output()
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
+func init() {
+	cleanupContainer()
+}
+
 func TestMain(m *testing.M) {
-	cmd := exec.Command("podman", "run", "-p", "19085:9000", "quay.io/minio/minio", "server", "/data")
+	cmd := exec.Command("podman", "run", "-p", "19085:9000", "--name", containerName, "quay.io/minio/minio", "server", "/data")
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		panic(err)
@@ -69,6 +99,8 @@ func TestMain(m *testing.M) {
 const testLogSaysPastTheEnd = "oh no! we fell off the end of the log!"
 
 func TestIntegration(t *testing.T) {
+	defer cleanupContainer()
+
 	// A test CT server that responds to get-entries requests with appropriately JSON-formatted
 	// data, where base64-decoding the LeafInput and ExtraData fields yields a binary encoding
 	// of the position of the given element.
@@ -134,14 +166,11 @@ func TestIntegration(t *testing.T) {
 	}
 	s3Service := s3.NewFromConfig(cfg)
 
-	_, err = s3Service.HeadBucket(context.TODO(), &s3.HeadBucketInput{Bucket: aws.String("bucket")})
+	_, err = s3Service.CreateBucket(context.Background(), &s3.CreateBucketInput{
+		Bucket: aws.String("bucket"),
+	})
 	if err != nil {
-		_, err = s3Service.CreateBucket(context.Background(), &s3.CreateBucketInput{
-			Bucket: aws.String("bucket"),
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		t.Fatal(err)
 	}
 
 	ctile := tileCachingHandler{
