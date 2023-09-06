@@ -134,11 +134,14 @@ func TestIntegration(t *testing.T) {
 	}
 	s3Service := s3.NewFromConfig(cfg)
 
-	_, err = s3Service.CreateBucket(context.Background(), &s3.CreateBucketInput{
-		Bucket: aws.String("bucket"),
-	})
+	_, err = s3Service.HeadBucket(context.TODO(), &s3.HeadBucketInput{Bucket: aws.String("bucket")})
 	if err != nil {
-		t.Fatal(err)
+		_, err = s3Service.CreateBucket(context.Background(), &s3.CreateBucketInput{
+			Bucket: aws.String("bucket"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	ctile := tileCachingHandler{
