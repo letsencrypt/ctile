@@ -469,6 +469,8 @@ func main() {
 		*s3prefix = *logURL
 	}
 
+	*s3bucket = strings.TrimPrefix(*s3bucket, "s3://")
+
 	cfg, err := config.LoadDefaultConfig(context.Background())
 	if err != nil {
 		log.Fatal(err)
