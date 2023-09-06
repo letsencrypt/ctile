@@ -99,14 +99,53 @@ func (t tile) url() string {
 // https://datatracker.ietf.org/doc/html/rfc6962#section-4.6
 //
 // It is marshaled and unmarshaled to/from JSON and CBOR.
+//
+// This type must not be mutated, because pointers to the same value may be in use
+// across multiple goroutines.
 type entries struct {
 	Entries []entry `json:"entries"`
+}
+
+// TrimForDisplay takes a set of entries corresponding to `tile`, and returns a new
+// object suitable for a request for entries in the range [start, end).
+//
+// This does not mutate the original object. It is suitable for calling when the set
+// of entries represents a partial tile.
+func (e *entries) TrimForDisplay(start, end int64, tile tile) (*entries, error) {
+	// Truncate to match the request
+	prefixToRemove := start - tile.start
+	if prefixToRemove >= int64(len(e.Entries)) {
+		// In this case, the requested range is entirely outside the current log,
+		// but the _tile_'s beginning was inside the log. For instance, a log with
+		// size 1000 and max_getentries of 256, where ctile is handling a request
+		// for start=1001&end=1001; the tile starts at offset 768, but is partial so
+		// it doesn't include the requested range.
+		//
+		// When Trillian gets a request that is past the end of the log, it returns
+		// 400 (for better or worse), so we emulate that here.
+		return nil, errors.New("requested range is past the end of the log")
+	}
+
+	if prefixToRemove < 0 {
+		return nil, fmt.Errorf("internal inconsistency: prefixToRemove = %d; tile = %v", prefixToRemove, tile)
+	}
+
+	requestedLen := end - start
+	if prefixToRemove+requestedLen > int64(len(e.Entries)) {
+		requestedLen = int64(len(e.Entries)) - prefixToRemove
+	}
+	return &entries{
+		Entries: e.Entries[prefixToRemove : prefixToRemove+requestedLen],
+	}, nil
 }
 
 // entry corresponds to a single entry in the CT get-entries endpoint.
 //
 // Note: the JSON fields are base64. For fields of type `[]byte`, Go's encoding/json
 // automagically decodes base64.
+//
+// This type must not be mutated, because pointers to the same value may be in use
+// across multiple goroutines.
 type entry struct {
 	LeafInput []byte `json:"leaf_input"`
 	ExtraData []byte `json:"extra_data"`
@@ -281,28 +320,11 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 	w.Header().Set("X-Source", string(source))
 
-	// Truncate to match the request
-	prefixToRemove := start - tile.start
-	if prefixToRemove >= int64(len(contents.Entries)) {
-		// In this case, the requested range is entirely outside the current log,
-		// but the _tile_'s beginning was inside the log. For instance, a log with
-		// size 1000 and max_getentries of 256, where ctile is handling a request
-		// for start=1001&end=1001; the tile starts at offset 768, but is partial so
-		// it doesn't include the requested range.
-		//
-		// When Trillian gets a request that is past the end of the log, it returns
-		// 400 (for better or worse), so we emulate that here.
-		tch.requestsMetric.WithLabelValues("error", "ct_log_past_end").Inc()
+	contents, err = contents.TrimForDisplay(start, end, tile)
+	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprintln(w, "requested range is past the end of the log")
+		fmt.Fprintln(w, err)
 		return
-	} else {
-		contents.Entries = contents.Entries[prefixToRemove:]
-	}
-
-	requestedLen := end - start
-	if len(contents.Entries) > int(requestedLen) {
-		contents.Entries = contents.Entries[:requestedLen]
 	}
 
 	if w.Header().Get("X-Source") == "S3" {
