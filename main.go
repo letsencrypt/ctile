@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -240,12 +239,6 @@ type tileCachingHandler struct {
 }
 
 func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !strings.HasSuffix(r.URL.Path, "/ct/v1/get-entries") {
-		w.WriteHeader(http.StatusNotFound)
-		fmt.Fprintf(w, "invalid path %q\n", r.URL.Path)
-		return
-	}
-
 	start, end, err := parseQueryParams(r.URL.Query())
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -382,6 +375,35 @@ func singleflightDo[V any](group *singleflight.Group, key string, fn func() (V, 
 	return out.(V), err, shared
 }
 
+// passthroughHandler is an HTTP handler that passes through GET requests to the CT log.
+type passthroughHandler struct {
+	logURL string
+}
+
+func (p passthroughHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		fmt.Fprintln(w, "only GET is supported")
+		return
+	}
+	url := fmt.Sprintf("%s%s", p.logURL, r.URL.Path)
+	r, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url, nil)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "creating request: %s\n", err)
+		return
+	}
+	resp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "fetching %s: %s\n", url, err)
+		return
+	}
+
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
 func main() {
 	logURL := flag.String("log-url", "", "CT log URL. e.g. https://oak.ct.letsencrypt.org/2023")
 	tileSize := flag.Int("tile-size", 0, "tile size. Must match the value used by the backend")
@@ -429,13 +451,17 @@ func main() {
 		cacheGroup: &singleflight.Group{},
 	}
 
+	mux := http.NewServeMux()
+	mux.Handle("/ct/v1/get-entries", handler)
+	mux.Handle("/ct/v1/", passthroughHandler{logURL: *logURL})
+
 	srv := http.Server{
 		Addr:              *listenAddress,
 		ReadTimeout:       5 * time.Second,
 		WriteTimeout:      *fullRequestTimeout + 1*time.Second, // must be a bit larger than than than the max time spent in the HTTP handler
 		IdleTimeout:       5 * time.Minute,
 		ReadHeaderTimeout: 2 * time.Second,
-		Handler:           http.TimeoutHandler(handler, *fullRequestTimeout, "full request timeout"),
+		Handler:           http.TimeoutHandler(mux, *fullRequestTimeout, "full request timeout"),
 	}
 
 	log.Fatal(srv.ListenAndServe())
