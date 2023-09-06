@@ -106,6 +106,12 @@ type entries struct {
 	Entries []entry `json:"entries"`
 }
 
+type pastTheEndError struct{}
+
+func (p pastTheEndError) Error() string {
+	return "requested range is past the end of the log"
+}
+
 // TrimForDisplay takes a set of entries corresponding to `tile`, and returns a new
 // object suitable for a request for entries in the range [start, end).
 //
@@ -127,7 +133,7 @@ func (e *entries) TrimForDisplay(start, end int64, tile tile) (*entries, error) 
 		//
 		// When Trillian gets a request that is past the end of the log, it returns
 		// 400 (for better or worse), so we emulate that here.
-		return nil, errors.New("requested range is past the end of the log")
+		return nil, pastTheEndError{}
 	}
 
 	requestedLen := end - start
@@ -322,6 +328,9 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 	contents, err = contents.TrimForDisplay(start, end, tile)
 	if err != nil {
+		if errors.As(err, &pastTheEndError{}) {
+			tch.requestsMetric.WithLabelValues("error", "ct_log_past_end").Inc()
+		}
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprintln(w, err)
 		return
