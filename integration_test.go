@@ -23,6 +23,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -149,6 +150,10 @@ func TestIntegration(t *testing.T) {
 		s3Bucket:  "bucket",
 
 		cacheGroup: &singleflight.Group{},
+
+		requestsMetric:     prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"result", "source"}),
+		partialTiles:       prometheus.NewCounter(prometheus.CounterOpts{}),
+		singleFlightShared: prometheus.NewCounter(prometheus.CounterOpts{}),
 	}
 
 	// Invalid URL; should 404
