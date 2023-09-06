@@ -321,6 +321,8 @@ func makeTCH(url string, s3Service *s3.Client) tileCachingHandler {
 
 		cacheGroup: &singleflight.Group{},
 
+		fullRequestTimeout: 10 * time.Second,
+
 		requestsMetric:     prometheus.NewCounterVec(prometheus.CounterOpts{Help: "foo", Name: "ctile_requests"}, []string{"result", "source"}),
 		partialTiles:       prometheus.NewCounter(prometheus.CounterOpts{Name: "ctile_partial_tiles"}),
 		singleFlightShared: prometheus.NewCounter(prometheus.CounterOpts{Name: "ctile_singleflight_shared"}),
