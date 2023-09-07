@@ -387,21 +387,25 @@ func (p passthroughHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	url := fmt.Sprintf("%s%s", p.logURL, r.URL.Path)
-	r, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url, nil)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintf(w, "creating request: %s\n", err)
 		return
 	}
-	resp, err := http.DefaultClient.Do(r)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintf(w, "fetching %s: %s\n", url, err)
 		return
 	}
+	defer resp.Body.Close()
 
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	_, err = io.Copy(w, resp.Body)
+	if err != nil {
+		log.Printf("copying response body to client: %s\n", err)
+	}
 }
 
 func main() {
