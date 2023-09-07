@@ -5,12 +5,10 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"os/exec"
 	"reflect"
 	"strconv"
@@ -27,48 +25,48 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-func TestMain(m *testing.M) {
-	cmd := exec.Command("podman", "run", "-p", "19085:9000", "quay.io/minio/minio", "server", "/data")
-	stderrPipe, err := cmd.StderrPipe()
+const containerName string = "ctile_integration_test_minio"
+const testLogSaysPastTheEnd string = "oh no! we fell off the end of the log!"
+
+func startContainer(t *testing.T) {
+	_, err := exec.Command("podman", "run", "--rm", "--detach", "-p", "19085:9000", "--name", containerName, "quay.io/minio/minio", "server", "/data").Output()
 	if err != nil {
-		panic(err)
+		t.Fatalf("minio failed to come up: %v", err)
 	}
-	err = cmd.Start()
-	if err != nil {
-		panic(err)
-	}
-	defer cmd.Process.Kill()
 	for i := 0; i < 1000; i++ {
 		_, err := net.Dial("tcp", "localhost:19085")
 		if errors.Is(err, syscall.ECONNREFUSED) {
+			t.Log("sleeping 10ms waiting for minio to come up")
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 		if err != nil {
-			panic(err)
+			t.Fatalf("failed to connect to minio: %v", err)
 		}
-		fmt.Println("minio is up")
-		break
+		t.Log("minio is up")
+		return
 	}
-	code := m.Run()
-	err = cmd.Process.Signal(os.Interrupt)
-	if err != nil {
-		panic(err)
-	}
-	io.Copy(os.Stderr, stderrPipe)
-	processState, err := cmd.Process.Wait()
-	if err != nil {
-		panic(err)
-	}
-	if processState.ExitCode() != 0 {
-		panic(fmt.Errorf("minio exited with code %d", processState.ExitCode()))
-	}
-	os.Exit(code)
+	t.Fatalf("failed to connect to minio: %v", err)
 }
 
-const testLogSaysPastTheEnd = "oh no! we fell off the end of the log!"
+// cleanupContainer stops a running named container and removes its assigned
+// name. This is helpful in the event that a container wasn't properly killed
+// during a previous test run or if manual testing was being performed and not
+// cleaned up.
+func cleanupContainer() {
+	// Unconditionally stop the container.
+	_, _ = exec.Command("podman", "stop", containerName).Output()
+
+	// Unconditionally remove the container name if the operator did manual
+	// container testing, but didn't clean up the name.
+	_, _ = exec.Command("podman", "rm", containerName).Output()
+}
 
 func TestIntegration(t *testing.T) {
+	cleanupContainer() // Clean up old containers and names just in case.
+	startContainer(t)
+	defer cleanupContainer()
+
 	// A test CT server that responds to get-entries requests with appropriately JSON-formatted
 	// data, where base64-decoding the LeafInput and ExtraData fields yields a binary encoding
 	// of the position of the given element.
