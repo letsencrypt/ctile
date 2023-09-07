@@ -30,27 +30,16 @@ import (
 const containerName string = "ctile_integration_test_minio"
 
 // cleanupContainer stops a running named container and removes its assigned
-// name.
+// name. This is helpful in the event that a container wasn't properly killed
+// during a previous test run or if manual testing was being performed and not
+// cleaned up.
 func cleanupContainer() {
-	// We throw away the error here because ps will return code 125 if the
-	// name doesn't exist, but that's the whole point of this check.
-	isContainerRunning, _ := exec.Command("podman", "ps", "--filter", fmt.Sprintf("name=%s", containerName), "--format={{ .ID }}").Output()
-	if len(isContainerRunning) > 0 {
-		_, err := exec.Command("podman", "stop", containerName).Output()
-		if err != nil {
-			panic(err)
-		}
-	}
+	// Unconditionally stop the container.
+	_, _ = exec.Command("podman", "stop", containerName).Output()
 
-	// We throw away the error here because ps will return code 125 if the
-	// name doesn't exist, but that's the whole point of this check.
-	danglingName, _ := exec.Command("podman", "ps", "--all", "--filter", fmt.Sprintf("name=%s", containerName), "--format={{ .ID }}").Output()
-	if len(danglingName) > 0 {
-		_, err := exec.Command("podman", "rm", "--force", containerName).Output()
-		if err != nil {
-			panic(err)
-		}
-	}
+	// Unconditionally remove the container name if the operator did manual
+	// container testing, but didn't clean up the name.
+	_, _ = exec.Command("podman", "rm", containerName).Output()
 }
 
 func init() {
@@ -58,16 +47,10 @@ func init() {
 }
 
 func TestMain(m *testing.M) {
-	cmd := exec.Command("podman", "run", "-p", "19085:9000", "--name", containerName, "quay.io/minio/minio", "server", "/data")
-	stderrPipe, err := cmd.StderrPipe()
+	_, err := exec.Command("podman", "run", "--rm", "--detach", "-p", "19085:9000", "--name", containerName, "quay.io/minio/minio", "server", "/data").Output()
 	if err != nil {
 		panic(err)
 	}
-	err = cmd.Start()
-	if err != nil {
-		panic(err)
-	}
-	defer cmd.Process.Kill()
 	for i := 0; i < 1000; i++ {
 		_, err := net.Dial("tcp", "localhost:19085")
 		if errors.Is(err, syscall.ECONNREFUSED) {
@@ -81,18 +64,6 @@ func TestMain(m *testing.M) {
 		break
 	}
 	code := m.Run()
-	err = cmd.Process.Signal(os.Interrupt)
-	if err != nil {
-		panic(err)
-	}
-	io.Copy(os.Stderr, stderrPipe)
-	processState, err := cmd.Process.Wait()
-	if err != nil {
-		panic(err)
-	}
-	if processState.ExitCode() != 0 {
-		panic(fmt.Errorf("minio exited with code %d", processState.ExitCode()))
-	}
 	os.Exit(code)
 }
 
