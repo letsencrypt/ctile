@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"os/exec"
 	"reflect"
 	"strconv"
@@ -28,25 +27,9 @@ import (
 )
 
 const containerName string = "ctile_integration_test_minio"
+const testLogSaysPastTheEnd string = "oh no! we fell off the end of the log!"
 
-// cleanupContainer stops a running named container and removes its assigned
-// name. This is helpful in the event that a container wasn't properly killed
-// during a previous test run or if manual testing was being performed and not
-// cleaned up.
-func cleanupContainer() {
-	// Unconditionally stop the container.
-	_, _ = exec.Command("podman", "stop", containerName).Output()
-
-	// Unconditionally remove the container name if the operator did manual
-	// container testing, but didn't clean up the name.
-	_, _ = exec.Command("podman", "rm", containerName).Output()
-}
-
-func init() {
-	cleanupContainer()
-}
-
-func TestMain(m *testing.M) {
+func startContainer() {
 	_, err := exec.Command("podman", "run", "--rm", "--detach", "-p", "19085:9000", "--name", containerName, "quay.io/minio/minio", "server", "/data").Output()
 	if err != nil {
 		panic(err)
@@ -63,11 +46,25 @@ func TestMain(m *testing.M) {
 		fmt.Println("minio is up")
 		break
 	}
-	code := m.Run()
-	os.Exit(code)
 }
 
-const testLogSaysPastTheEnd = "oh no! we fell off the end of the log!"
+// cleanupContainer stops a running named container and removes its assigned
+// name. This is helpful in the event that a container wasn't properly killed
+// during a previous test run or if manual testing was being performed and not
+// cleaned up.
+func cleanupContainer() {
+	// Unconditionally stop the container.
+	_, _ = exec.Command("podman", "stop", containerName).Output()
+
+	// Unconditionally remove the container name if the operator did manual
+	// container testing, but didn't clean up the name.
+	_, _ = exec.Command("podman", "rm", containerName).Output()
+}
+
+func init() {
+	cleanupContainer()
+	startContainer()
+}
 
 func TestIntegration(t *testing.T) {
 	defer cleanupContainer()
