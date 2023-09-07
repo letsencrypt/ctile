@@ -156,10 +156,10 @@ func TestIntegration(t *testing.T) {
 		singleFlightShared: prometheus.NewCounter(prometheus.CounterOpts{}),
 	}
 
-	// Invalid URL; should 404
+	// Invalid URL; should be passed through to backend and 400
 	resp := getResp(ctile, "/foo")
-	if resp.StatusCode != 404 {
-		t.Errorf("expected 404 got %d", resp.StatusCode)
+	if resp.StatusCode != 400 {
+		t.Errorf("expected 400 got %d", resp.StatusCode)
 	}
 
 	// Malformed queries; should 400
