@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -29,23 +28,25 @@ import (
 const containerName string = "ctile_integration_test_minio"
 const testLogSaysPastTheEnd string = "oh no! we fell off the end of the log!"
 
-func startContainer() {
+func startContainer(t *testing.T) {
 	_, err := exec.Command("podman", "run", "--rm", "--detach", "-p", "19085:9000", "--name", containerName, "quay.io/minio/minio", "server", "/data").Output()
 	if err != nil {
-		panic(err)
+		t.Fatalf("minio failed to come up: %v", err)
 	}
 	for i := 0; i < 1000; i++ {
 		_, err := net.Dial("tcp", "localhost:19085")
 		if errors.Is(err, syscall.ECONNREFUSED) {
+			t.Log("sleeping 10ms waiting for minio to come up")
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 		if err != nil {
-			panic(err)
+			t.Fatalf("failed to connect to minio: %v", err)
 		}
-		fmt.Println("minio is up")
-		break
+		t.Log("minio is up")
+		return
 	}
+	t.Fatalf("failed to connect to minio: %v", err)
 }
 
 // cleanupContainer stops a running named container and removes its assigned
@@ -61,12 +62,9 @@ func cleanupContainer() {
 	_, _ = exec.Command("podman", "rm", containerName).Output()
 }
 
-func init() {
-	cleanupContainer()
-	startContainer()
-}
-
 func TestIntegration(t *testing.T) {
+	cleanupContainer() // Clean up old containers and names just in case.
+	startContainer(t)
 	defer cleanupContainer()
 
 	// A test CT server that responds to get-entries requests with appropriately JSON-formatted
