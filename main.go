@@ -289,6 +289,8 @@ type tileCachingHandler struct {
 	requestsMetric     *prometheus.CounterVec
 	partialTiles       prometheus.Counter
 	singleFlightShared prometheus.Counter
+
+	fullRequestTimeout time.Duration
 }
 
 func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -299,9 +301,12 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	ctx, cancel := context.WithTimeout(r.Context(), tch.fullRequestTimeout)
+	defer cancel()
+
 	tile := makeTile(start, int64(tch.tileSize), tch.logURL)
 
-	contents, source, err := tch.getAndCacheTile(r.Context(), tile)
+	contents, source, err := tch.getAndCacheTile(ctx, tile)
 	if err != nil {
 		status := http.StatusInternalServerError
 		var statusCodeErr statusCodeError
@@ -557,7 +562,7 @@ func main() {
 		WriteTimeout:      *fullRequestTimeout + 1*time.Second, // must be a bit larger than the max time spent in the HTTP handler
 		IdleTimeout:       5 * time.Minute,
 		ReadHeaderTimeout: 2 * time.Second,
-		Handler:           http.TimeoutHandler(mux, *fullRequestTimeout, "full request timeout"),
+		Handler:           mux,
 	}
 
 	log.Fatal(srv.ListenAndServe())
