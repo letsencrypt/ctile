@@ -313,6 +313,10 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		if errors.As(err, &statusCodeErr) {
 			status = statusCodeErr.statusCode
 		}
+		// Send errors to our stdout as well as to the user.
+		if status != http.StatusBadRequest {
+			log.Println(err)
+		}
 		w.WriteHeader(status)
 		fmt.Fprintln(w, err)
 		return
