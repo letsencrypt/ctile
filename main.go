@@ -556,6 +556,7 @@ func main() {
 		s3Service:          svc,
 		s3Prefix:           *s3prefix,
 		s3Bucket:           *s3bucket,
+		fullRequestTimeout: *fullRequestTimeout,
 		cacheGroup:         &singleflight.Group{},
 		requestsMetric:     requestsMetric,
 		partialTiles:       partialTiles,
