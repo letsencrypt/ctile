@@ -74,6 +74,10 @@ func TestIntegration(t *testing.T) {
 	//
 	// This acts like a CT log with a max_getentries limit of 3 and 10 elements in total.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ct/v1/get-entries" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		startInt, _ := strconv.ParseInt(r.URL.Query().Get("start"), 10, 64)
 		endInt, _ := strconv.ParseInt(r.URL.Query().Get("end"), 10, 64)
 		var entries entries
@@ -142,10 +146,10 @@ func TestIntegration(t *testing.T) {
 
 	ctile := makeTCH(server.URL, s3Service)
 
-	// Invalid URL; should be passed through to backend and 400
+	// Invalid URL; should 404 passed through to backend and 400
 	resp := getResp(ctile, "/foo")
-	if resp.StatusCode != 400 {
-		t.Errorf("expected 400 got %d", resp.StatusCode)
+	if resp.StatusCode != 404 {
+		t.Errorf("expected 404 got %d", resp.StatusCode)
 	}
 
 	// Malformed queries; should 400
@@ -196,6 +200,13 @@ func TestIntegration(t *testing.T) {
 	if len(twoEntriesB.Entries) != 2 {
 		t.Errorf("expected 2 entries got %d", len(twoEntriesB.Entries))
 	}
+
+	// Same query with a different prefix; should succeed
+	_, _, err = getAndParseResp(t, ctile, "/ctile/ct/v1/get-entries?start=3&end=4")
+	if err != nil {
+		t.Error(err)
+	}
+	ctile.requestsMetric.Reset()
 
 	// The results from the first and second queries should be the same
 	if !reflect.DeepEqual(twoEntriesA, twoEntriesB) {
