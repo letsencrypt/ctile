@@ -294,6 +294,70 @@ type tileCachingHandler struct {
 	fullRequestTimeout time.Duration
 }
 
+func newTileCachingHandler(
+	logURL string,
+	tileSize int,
+	s3Service *s3.Client,
+	s3Prefix string,
+	s3Bucket string,
+	fullRequestTimeout time.Duration,
+	promRegisterer prometheus.Registerer,
+) (*tileCachingHandler, error) {
+	if logURL == "" {
+		return nil, errors.New("logURL must not be empty")
+	}
+	if tileSize == 0 {
+		return nil, errors.New("tileSize must not be zero")
+	}
+	if s3Service == nil {
+		return nil, errors.New("s3Service must not be nil")
+	}
+	if s3Prefix == "" {
+		return nil, errors.New("s3Prefix must not be empty")
+	}
+	if s3Bucket == "" {
+		return nil, errors.New("s3Bucket must not be empty")
+	}
+	if fullRequestTimeout == 0 {
+		return nil, errors.New("fullRequestTimeout must not be zero")
+	}
+	requestsMetric := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ctile_requests",
+			Help: "total number of requests, by result and source",
+		},
+		[]string{"result", "source"},
+	)
+	promRegisterer.MustRegister(requestsMetric)
+
+	partialTiles := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ctile_partial_tiles",
+			Help: "number of requests not cached due to partial tile returned from CT log",
+		})
+	promRegisterer.MustRegister(partialTiles)
+
+	singleFlightShared := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ctile_single_flight_shared",
+			Help: "number of inbound requests coalesced into a single set of backend requests",
+		})
+	promRegisterer.MustRegister(singleFlightShared)
+
+	return &tileCachingHandler{
+		logURL:             logURL,
+		tileSize:           tileSize,
+		s3Service:          s3Service,
+		s3Prefix:           s3Prefix,
+		s3Bucket:           s3Bucket,
+		cacheGroup:         &singleflight.Group{},
+		requestsMetric:     requestsMetric,
+		partialTiles:       partialTiles,
+		singleFlightShared: singleFlightShared,
+		fullRequestTimeout: fullRequestTimeout,
+	}, nil
+}
+
 func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// For non-get-entries requests, pass them along to the backend
 	if !strings.HasSuffix(r.URL.Path, "/ct/v1/get-entries") {
@@ -527,40 +591,9 @@ func main() {
 
 	promRegistry := newStatsRegistry(*metricsAddress)
 
-	requestsMetric := prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "ctile_requests",
-			Help: "total number of requests, by result and source",
-		},
-		[]string{"result", "source"},
-	)
-	promRegistry.MustRegister(requestsMetric)
-
-	partialTiles := prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "ctile_partial_tiles",
-			Help: "number of requests not cached due to partial tile returned from CT log",
-		})
-	promRegistry.MustRegister(partialTiles)
-
-	singleFlightShared := prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "ctile_single_flight_shared",
-			Help: "number of inbound requests coalesced into a single set of backend requests",
-		})
-	promRegistry.MustRegister(singleFlightShared)
-
-	handler := &tileCachingHandler{
-		logURL:             *logURL,
-		tileSize:           *tileSize,
-		s3Service:          svc,
-		s3Prefix:           *s3prefix,
-		s3Bucket:           *s3bucket,
-		fullRequestTimeout: *fullRequestTimeout,
-		cacheGroup:         &singleflight.Group{},
-		requestsMetric:     requestsMetric,
-		partialTiles:       partialTiles,
-		singleFlightShared: singleFlightShared,
+	handler, err := newTileCachingHandler(*logURL, *tileSize, svc, *s3prefix, *s3bucket, *fullRequestTimeout, promRegistry)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	srv := http.Server{

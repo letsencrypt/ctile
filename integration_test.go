@@ -23,7 +23,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
-	"golang.org/x/sync/singleflight"
 )
 
 const containerName string = "ctile_integration_test_minio"
@@ -285,7 +284,7 @@ func TestIntegration(t *testing.T) {
 	expectAndResetMetric(t, erroringCTile.requestsMetric, 1, "error", "ct_log_get")
 }
 
-func getResp(ctile tileCachingHandler, url string) *http.Response {
+func getResp(ctile *tileCachingHandler, url string) *http.Response {
 	req := httptest.NewRequest("GET", url, nil)
 	w := httptest.NewRecorder()
 
@@ -294,7 +293,7 @@ func getResp(ctile tileCachingHandler, url string) *http.Response {
 	return w.Result()
 }
 
-func getAndParseResp(t *testing.T, ctile tileCachingHandler, url string) (entries, http.Header, error) {
+func getAndParseResp(t *testing.T, ctile *tileCachingHandler, url string) (entries, http.Header, error) {
 	t.Helper()
 	resp := getResp(ctile, url)
 	body, _ := io.ReadAll(resp.Body)
@@ -321,21 +320,10 @@ func expectAndResetMetric(t *testing.T, metric *prometheus.CounterVec, expected 
 	metric.Reset()
 }
 
-func makeTCH(url string, s3Service *s3.Client) tileCachingHandler {
-	return tileCachingHandler{
-		logURL:   url,
-		tileSize: 3,
-
-		s3Service: s3Service,
-		s3Prefix:  "test",
-		s3Bucket:  "bucket",
-
-		cacheGroup: &singleflight.Group{},
-
-		fullRequestTimeout: 10 * time.Second,
-
-		requestsMetric:     prometheus.NewCounterVec(prometheus.CounterOpts{Help: "foo", Name: "ctile_requests"}, []string{"result", "source"}),
-		partialTiles:       prometheus.NewCounter(prometheus.CounterOpts{Name: "ctile_partial_tiles"}),
-		singleFlightShared: prometheus.NewCounter(prometheus.CounterOpts{Name: "ctile_singleflight_shared"}),
+func makeTCH(url string, s3Service *s3.Client) *tileCachingHandler {
+	tch, err := newTileCachingHandler(url, 3, s3Service, "test", "bucket", 10*time.Second, prometheus.NewRegistry())
+	if err != nil {
+		panic(err)
 	}
+	return tch
 }
