@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -294,6 +295,11 @@ type tileCachingHandler struct {
 }
 
 func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// For non-get-entries requests, pass them along to the backend
+	if !strings.HasSuffix(r.URL.Path, "/ct/v1/get-entries") {
+		passthroughHandler{logURL: tch.logURL}.ServeHTTP(w, r)
+		return
+	}
 	start, end, err := parseQueryParams(r.URL.Query())
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -556,17 +562,13 @@ func main() {
 		singleFlightShared: singleFlightShared,
 	}
 
-	mux := http.NewServeMux()
-	mux.Handle("/ct/v1/get-entries", handler)
-	mux.Handle("/ct/v1/", passthroughHandler{logURL: *logURL})
-
 	srv := http.Server{
 		Addr:              *listenAddress,
 		ReadTimeout:       5 * time.Second,
 		WriteTimeout:      *fullRequestTimeout + 1*time.Second, // must be a bit larger than the max time spent in the HTTP handler
 		IdleTimeout:       5 * time.Minute,
 		ReadHeaderTimeout: 2 * time.Second,
-		Handler:           mux,
+		Handler:           handler,
 	}
 
 	log.Fatal(srv.ListenAndServe())
