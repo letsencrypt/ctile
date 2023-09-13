@@ -349,7 +349,7 @@ func newTileCachingHandler(
 	latencyMetric := prometheus.NewHistogram(
 		prometheus.HistogramOpts{
 			Name:    "ctile_response_latency_seconds",
-			Help:    "latency of responses",
+			Help:    "overall latency of responses, including all backend requests",
 			Buckets: prometheus.DefBuckets,
 		})
 	promRegisterer.MustRegister(latencyMetric)
@@ -357,7 +357,7 @@ func newTileCachingHandler(
 	backendLatencyMetric := prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "ctile_backend_latency_seconds",
-			Help:    "latency of responses",
+			Help:    "latency of each backend request",
 			Buckets: prometheus.DefBuckets,
 		},
 		[]string{"backend"})
@@ -487,9 +487,9 @@ func (tch *tileCachingHandler) getAndCacheTile(ctx context.Context, tile tile) (
 // getAndCacheTileUncollapsed is the core of getAndCacheTile (and is used by it)
 // without the request collapsing. Use getAndCacheTile instead of this method.
 func (tch *tileCachingHandler) getAndCacheTileUncollapsed(ctx context.Context, tile tile) (*entries, tileSource, error) {
-	begin := time.Now()
+	beginS3Get := time.Now()
 	contents, err := tch.getFromS3(ctx, tile)
-	tch.backendLatencyMetric.WithLabelValues("s3_get").Observe(time.Since(begin).Seconds())
+	tch.backendLatencyMetric.WithLabelValues("s3_get").Observe(time.Since(beginS3Get).Seconds())
 
 	if err == nil {
 		return contents, sourceS3, nil
@@ -500,9 +500,9 @@ func (tch *tileCachingHandler) getAndCacheTileUncollapsed(ctx context.Context, t
 		return nil, sourceS3, fmt.Errorf("error reading tile from s3: %w", err)
 	}
 
-	begin = time.Now()
+	beginCTLogGet := time.Now()
 	contents, err = getTileFromBackend(ctx, tile)
-	tch.backendLatencyMetric.WithLabelValues("ct_log_get").Observe(time.Since(begin).Seconds())
+	tch.backendLatencyMetric.WithLabelValues("ct_log_get").Observe(time.Since(beginCTLogGet).Seconds())
 
 	if err != nil {
 		var statusCodeErr statusCodeError
@@ -524,9 +524,9 @@ func (tch *tileCachingHandler) getAndCacheTileUncollapsed(ctx context.Context, t
 		return contents, sourceCTLog, nil
 	}
 
-	begin = time.Now()
+	beginS3Put := time.Now()
 	err = tch.writeToS3(ctx, tile, contents)
-	tch.backendLatencyMetric.WithLabelValues("s3_put").Observe(time.Since(begin).Seconds())
+	tch.backendLatencyMetric.WithLabelValues("s3_put").Observe(time.Since(beginS3Put).Seconds())
 
 	if err != nil {
 		tch.requestsMetric.WithLabelValues("error", "s3_put").Inc()
