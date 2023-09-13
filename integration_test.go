@@ -23,7 +23,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
-	"golang.org/x/sync/singleflight"
 )
 
 const containerName string = "ctile_integration_test_minio"
@@ -144,7 +143,7 @@ func TestIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctile := makeTCH(server.URL, s3Service)
+	ctile := makeTCH(t, server.URL, s3Service)
 
 	// Invalid URL; should 404 passed through to backend and 400
 	resp := getResp(ctile, "/foo")
@@ -277,7 +276,7 @@ func TestIntegration(t *testing.T) {
 	}))
 	defer server.Close()
 
-	erroringCTile := makeTCH(errorCTLog.URL, s3Service)
+	erroringCTile := makeTCH(t, errorCTLog.URL, s3Service)
 	resp = getResp(erroringCTile, "/ct/v1/get-entries?start=0&end=1")
 	if resp.StatusCode != 500 {
 		t.Errorf("expected 500 got %d", resp.StatusCode)
@@ -285,7 +284,7 @@ func TestIntegration(t *testing.T) {
 	expectAndResetMetric(t, erroringCTile.requestsMetric, 1, "error", "ct_log_get")
 }
 
-func getResp(ctile tileCachingHandler, url string) *http.Response {
+func getResp(ctile *tileCachingHandler, url string) *http.Response {
 	req := httptest.NewRequest("GET", url, nil)
 	w := httptest.NewRecorder()
 
@@ -294,7 +293,7 @@ func getResp(ctile tileCachingHandler, url string) *http.Response {
 	return w.Result()
 }
 
-func getAndParseResp(t *testing.T, ctile tileCachingHandler, url string) (entries, http.Header, error) {
+func getAndParseResp(t *testing.T, ctile *tileCachingHandler, url string) (entries, http.Header, error) {
 	t.Helper()
 	resp := getResp(ctile, url)
 	body, _ := io.ReadAll(resp.Body)
@@ -321,21 +320,10 @@ func expectAndResetMetric(t *testing.T, metric *prometheus.CounterVec, expected 
 	metric.Reset()
 }
 
-func makeTCH(url string, s3Service *s3.Client) tileCachingHandler {
-	return tileCachingHandler{
-		logURL:   url,
-		tileSize: 3,
-
-		s3Service: s3Service,
-		s3Prefix:  "test",
-		s3Bucket:  "bucket",
-
-		cacheGroup: &singleflight.Group{},
-
-		fullRequestTimeout: 10 * time.Second,
-
-		requestsMetric:     prometheus.NewCounterVec(prometheus.CounterOpts{Help: "foo", Name: "ctile_requests"}, []string{"result", "source"}),
-		partialTiles:       prometheus.NewCounter(prometheus.CounterOpts{Name: "ctile_partial_tiles"}),
-		singleFlightShared: prometheus.NewCounter(prometheus.CounterOpts{Name: "ctile_singleflight_shared"}),
+func makeTCH(t *testing.T, url string, s3Service *s3.Client) *tileCachingHandler {
+	tch, err := newTileCachingHandler(url, 3, s3Service, "test", "bucket", 10*time.Second, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
 	}
+	return tch
 }
