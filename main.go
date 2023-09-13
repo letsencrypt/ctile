@@ -287,9 +287,11 @@ type tileCachingHandler struct {
 
 	cacheGroup *singleflight.Group // The singleflight.Group to use for deduplicating simultaneous requests (a.k.a. "request collapsing") for tiles. Must not be nil.
 
-	requestsMetric     *prometheus.CounterVec
-	partialTiles       prometheus.Counter
-	singleFlightShared prometheus.Counter
+	requestsMetric       *prometheus.CounterVec
+	partialTiles         prometheus.Counter
+	singleFlightShared   prometheus.Counter
+	latencyMetric        prometheus.Histogram
+	backendLatencyMetric *prometheus.HistogramVec
 
 	fullRequestTimeout time.Duration
 }
@@ -344,22 +346,45 @@ func newTileCachingHandler(
 		})
 	promRegisterer.MustRegister(singleFlightShared)
 
+	latencyMetric := prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "ctile_response_latency_seconds",
+			Help:    "latency of responses",
+			Buckets: prometheus.DefBuckets,
+		})
+	promRegisterer.MustRegister(latencyMetric)
+
+	backendLatencyMetric := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "ctile_backend_latency_seconds",
+			Help:    "latency of responses",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"backend"})
+	promRegisterer.MustRegister(backendLatencyMetric)
+
 	return &tileCachingHandler{
-		logURL:             logURL,
-		tileSize:           tileSize,
-		s3Service:          s3Service,
-		s3Prefix:           s3Prefix,
-		s3Bucket:           s3Bucket,
-		cacheGroup:         &singleflight.Group{},
-		requestsMetric:     requestsMetric,
-		partialTiles:       partialTiles,
-		singleFlightShared: singleFlightShared,
-		fullRequestTimeout: fullRequestTimeout,
+		logURL:               logURL,
+		tileSize:             tileSize,
+		s3Service:            s3Service,
+		s3Prefix:             s3Prefix,
+		s3Bucket:             s3Bucket,
+		cacheGroup:           &singleflight.Group{},
+		requestsMetric:       requestsMetric,
+		partialTiles:         partialTiles,
+		singleFlightShared:   singleFlightShared,
+		fullRequestTimeout:   fullRequestTimeout,
+		latencyMetric:        latencyMetric,
+		backendLatencyMetric: backendLatencyMetric,
 	}, nil
 }
 
 func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// For non-get-entries requests, pass them along to the backend
+	begin := time.Now()
+	defer func() {
+		tch.latencyMetric.Observe(time.Since(begin).Seconds())
+	}()
+
 	if !strings.HasSuffix(r.URL.Path, "/ct/v1/get-entries") {
 		passthroughHandler{logURL: tch.logURL}.ServeHTTP(w, r)
 		return
@@ -462,7 +487,10 @@ func (tch *tileCachingHandler) getAndCacheTile(ctx context.Context, tile tile) (
 // getAndCacheTileUncollapsed is the core of getAndCacheTile (and is used by it)
 // without the request collapsing. Use getAndCacheTile instead of this method.
 func (tch *tileCachingHandler) getAndCacheTileUncollapsed(ctx context.Context, tile tile) (*entries, tileSource, error) {
+	begin := time.Now()
 	contents, err := tch.getFromS3(ctx, tile)
+	tch.backendLatencyMetric.WithLabelValues("s3_get").Observe(time.Since(begin).Seconds())
+
 	if err == nil {
 		return contents, sourceS3, nil
 	}
@@ -472,7 +500,10 @@ func (tch *tileCachingHandler) getAndCacheTileUncollapsed(ctx context.Context, t
 		return nil, sourceS3, fmt.Errorf("error reading tile from s3: %w", err)
 	}
 
+	begin = time.Now()
 	contents, err = getTileFromBackend(ctx, tile)
+	tch.backendLatencyMetric.WithLabelValues("ct_log_get").Observe(time.Since(begin).Seconds())
+
 	if err != nil {
 		var statusCodeErr statusCodeError
 		// Requests for tiles past the end of the log will get a 400 from CTFE, so report those
@@ -493,11 +524,15 @@ func (tch *tileCachingHandler) getAndCacheTileUncollapsed(ctx context.Context, t
 		return contents, sourceCTLog, nil
 	}
 
+	begin = time.Now()
 	err = tch.writeToS3(ctx, tile, contents)
+	tch.backendLatencyMetric.WithLabelValues("s3_put").Observe(time.Since(begin).Seconds())
+
 	if err != nil {
 		tch.requestsMetric.WithLabelValues("error", "s3_put").Inc()
 		return nil, sourceCTLog, fmt.Errorf("error writing tile to S3: %w", err)
 	}
+
 	return contents, sourceCTLog, nil
 }
 
