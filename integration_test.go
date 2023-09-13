@@ -143,7 +143,7 @@ func TestIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctile := makeTCH(server.URL, s3Service)
+	ctile := makeTCH(t, server.URL, s3Service)
 
 	// Invalid URL; should 404 passed through to backend and 400
 	resp := getResp(ctile, "/foo")
@@ -276,7 +276,7 @@ func TestIntegration(t *testing.T) {
 	}))
 	defer server.Close()
 
-	erroringCTile := makeTCH(errorCTLog.URL, s3Service)
+	erroringCTile := makeTCH(t, errorCTLog.URL, s3Service)
 	resp = getResp(erroringCTile, "/ct/v1/get-entries?start=0&end=1")
 	if resp.StatusCode != 500 {
 		t.Errorf("expected 500 got %d", resp.StatusCode)
@@ -320,10 +320,10 @@ func expectAndResetMetric(t *testing.T, metric *prometheus.CounterVec, expected 
 	metric.Reset()
 }
 
-func makeTCH(url string, s3Service *s3.Client) *tileCachingHandler {
+func makeTCH(t *testing.T, url string, s3Service *s3.Client) *tileCachingHandler {
 	tch, err := newTileCachingHandler(url, 3, s3Service, "test", "bucket", 10*time.Second, prometheus.NewRegistry())
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	return tch
 }
