@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -100,6 +101,9 @@ func TestIntegration(t *testing.T) {
 		}
 
 		for i := startInt; i <= endInt; i++ {
+			// Put fake data in leafInput and extraData. Normally these would contain
+			// certificates, but instead we encode the offset within the log, which
+			// allows us to check later that we got the correct log offsets.
 			leafInput := make([]byte, 8)
 			binary.PutVarint(leafInput, i)
 			extraData := make([]byte, 8)
@@ -180,6 +184,24 @@ func TestIntegration(t *testing.T) {
 
 	if len(twoEntriesA.Entries) != 2 {
 		t.Errorf("expected 2 entries got %d", len(twoEntriesA.Entries))
+	}
+
+	n, err := binary.ReadVarint(bytes.NewReader(twoEntriesA.Entries[0].LeafInput))
+	if err != nil {
+		t.Error(err)
+	}
+
+	if n != 3 {
+		t.Errorf("expected first leafinput in response to be 3rd in log overall got %d", n)
+	}
+
+	n, err = binary.ReadVarint(bytes.NewReader(twoEntriesA.Entries[1].LeafInput))
+	if err != nil {
+		t.Error(err)
+	}
+
+	if n != 4 {
+		t.Errorf("expected second leaf_input in response to be 4th in log overall got %d", n)
 	}
 
 	successes := testutil.ToFloat64(ctile.requestsMetric.WithLabelValues("success", "ct_log_get"))
