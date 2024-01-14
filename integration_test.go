@@ -179,6 +179,7 @@ func TestIntegration(t *testing.T) {
 		t.Error(err)
 	}
 
+	expectHeader(t, headers, "Content-Type", "application/json")
 	expectHeader(t, headers, "X-Source", "CT log")
 
 	if len(twoEntriesA.Entries) != 2 {
@@ -215,6 +216,7 @@ func TestIntegration(t *testing.T) {
 		t.Error(err)
 	}
 
+	expectHeader(t, headers, "Content-Type", "application/json")
 	expectHeader(t, headers, "X-Source", "S3")
 	expectAndResetMetric(t, ctile.requestsMetric, 1, "success", "s3_get")
 
