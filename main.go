@@ -442,6 +442,7 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 
 	w.Header().Set("X-Response-Len", fmt.Sprintf("%d", len(contents.Entries)))
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 
 	encoder := json.NewEncoder(w)
