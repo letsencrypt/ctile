@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -275,7 +276,11 @@ func TestIntegration(t *testing.T) {
 	if resp.StatusCode != 400 {
 		t.Errorf("expected 400 got %d", resp.StatusCode)
 	}
-	body, _ := io.ReadAll(resp.Body)
+	gzReader, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(gzReader)
 	if !strings.Contains(string(body), testLogSaysPastTheEnd) {
 		t.Errorf("expected response to contain %q got %q", testLogSaysPastTheEnd, body)
 	}
@@ -310,6 +315,7 @@ func TestIntegration(t *testing.T) {
 
 func getResp(ctile *tileCachingHandler, url string) *http.Response {
 	req := httptest.NewRequest("GET", url, nil)
+	req.Header.Set("Accept-Encoding", "gzip")
 	w := httptest.NewRecorder()
 
 	ctile.ServeHTTP(w, req)
@@ -324,8 +330,20 @@ func getAndParseResp(t *testing.T, ctile *tileCachingHandler, url string) (entri
 	if resp.StatusCode != 200 {
 		t.Fatalf("%q: expected status code 200 got %d with body: %q", url, resp.StatusCode, body)
 	}
+	if resp.Header.Get("Content-Encoding") != "gzip" {
+		t.Fatalf("expected Content-Encoding: gzip, got %q", resp.Header.Get("Content-Encoding"))
+	}
+	gzipReader, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jsonBytes, err := io.ReadAll(gzipReader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	var entries entries
-	err := json.Unmarshal(body, &entries)
+	err = json.Unmarshal(jsonBytes, &entries)
 	return entries, resp.Header, err
 }
 

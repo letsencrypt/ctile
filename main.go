@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NYTimes/gziphandler"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -294,6 +295,8 @@ type tileCachingHandler struct {
 	backendLatencyMetric *prometheus.HistogramVec
 
 	fullRequestTimeout time.Duration
+
+	gzipHandler http.Handler
 }
 
 func newTileCachingHandler(
@@ -363,7 +366,7 @@ func newTileCachingHandler(
 		[]string{"backend"})
 	promRegisterer.MustRegister(backendLatencyMetric)
 
-	return &tileCachingHandler{
+	tch := tileCachingHandler{
 		logURL:               logURL,
 		tileSize:             tileSize,
 		s3Service:            s3Service,
@@ -376,10 +379,23 @@ func newTileCachingHandler(
 		fullRequestTimeout:   fullRequestTimeout,
 		latencyMetric:        latencyMetric,
 		backendLatencyMetric: backendLatencyMetric,
-	}, nil
+	}
+
+	handlerMaker, err := gziphandler.NewGzipLevelAndMinSize(gzip.BestSpeed, 100)
+	if err != nil {
+		return nil, err
+	}
+
+	tch.gzipHandler = handlerMaker(http.HandlerFunc(tch.serveHTTPInner))
+
+	return &tch, nil
 }
 
 func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	tch.gzipHandler.ServeHTTP(w, r)
+}
+
+func (tch *tileCachingHandler) serveHTTPInner(w http.ResponseWriter, r *http.Request) {
 	begin := time.Now()
 	defer func() {
 		tch.latencyMetric.Observe(time.Since(begin).Seconds())
